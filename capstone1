@@ -1,0 +1,2938 @@
+# ============================================================
+# PHYSICIAN BRAND ADOPTION - FINAL END-TO-END PIPELINE
+# ============================================================
+# Input File 1 = quarterly physician activity
+# Input File 2 = static physician profile
+#
+# Models:
+#   1. XGBoost
+#   2. LightGBM
+#
+# Method:
+#   Merge -> time preparation -> lag creation ->
+#   next-quarter target -> train/test split ->
+#   EDA -> train-only correlation/VIF ->
+#   feature selection -> one-hot encoding ->
+#   StratifiedGroupKFold -> SMOTE inside folds ->
+#   Optuna -> final models ->
+#   train/validation/test evaluation ->
+#   recall-aware threshold ->
+#   SHAP -> physician prediction
+#
+# IMPORTANT:
+# No information from the final test set is used for:
+#   - feature selection
+#   - imputation fitting
+#   - encoding fitting
+#   - SMOTE
+#   - Optuna
+#   - threshold optimization
+# ============================================================
+
+# ============================================================
+# 1. INSTALL IF REQUIRED
+# ============================================================
+
+# !pip install pandas numpy matplotlib seaborn scikit-learn
+# !pip install imbalanced-learn optuna xgboost lightgbm shap statsmodels
+
+# ============================================================
+# 2. IMPORTS
+# ============================================================
+
+import warnings
+warnings.filterwarnings("ignore")
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+from sklearn.compose import ColumnTransformer
+from sklearn.impute import SimpleImputer
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.pipeline import Pipeline as SkPipeline
+
+from sklearn.model_selection import (
+    StratifiedGroupKFold,
+    cross_val_score
+)
+
+from sklearn.metrics import (
+    accuracy_score,
+    precision_score,
+    recall_score,
+    f1_score,
+    roc_auc_score,
+    average_precision_score,
+    confusion_matrix,
+    classification_report,
+    brier_score_loss
+)
+
+from imblearn.pipeline import Pipeline
+from imblearn.over_sampling import SMOTE
+
+import optuna
+
+from xgboost import XGBClassifier
+from lightgbm import LGBMClassifier
+
+from statsmodels.stats.outliers_influence import (
+    variance_inflation_factor
+)
+
+import shap
+
+# ============================================================
+# 3. CONFIGURATION
+# ============================================================
+
+RANDOM_STATE = 42
+
+FILE1 = "Input_data_file1.csv"
+FILE2 = "Input_data_file2.csv"
+TEST_PHYSICIANS_FILE = "Test_physicians.csv"
+
+ID_COL = "physician_id"
+QTR_COL = "year_quarter"
+TARGET_COL = "brand_prescribed"
+
+# Only previous 2 quarters
+LAG_PERIODS = [1, 2]
+
+# Optuna
+N_TRIALS = 10
+
+# Stratified Group K Fold
+N_SPLITS = 3
+
+# Correlation threshold
+CORR_THRESHOLD = 0.85
+
+# VIF threshold
+VIF_THRESHOLD = 10
+
+# Desired compact feature size
+MAX_NUMERIC_FEATURES = 14
+MAX_CATEGORICAL_FEATURES = 3
+
+# ============================================================
+# 4. LOAD DATA
+# ============================================================
+
+file1 = pd.read_csv(FILE1)
+file2 = pd.read_csv(FILE2)
+test_physicians = pd.read_csv(TEST_PHYSICIANS_FILE)
+
+print("=" * 80)
+print("RAW DATA")
+print("=" * 80)
+
+print("Input File 1:", file1.shape)
+print("Input File 2:", file2.shape)
+print("Test Physicians:", test_physicians.shape)
+
+print("\nFile 1 columns:")
+print(file1.columns.tolist())
+
+print("\nFile 2 columns:")
+print(file2.columns.tolist())
+
+# ============================================================
+# 5. BASIC VALIDATION
+# ============================================================
+
+required_file1 = {
+    ID_COL,
+    QTR_COL,
+    TARGET_COL
+}
+
+missing_file1 = (
+    required_file1 - set(file1.columns)
+)
+
+if missing_file1:
+    raise ValueError(
+        f"Missing columns in File 1: {missing_file1}"
+    )
+
+if ID_COL not in file2.columns:
+    raise ValueError(
+        f"{ID_COL} missing from File 2."
+    )
+
+if file2[ID_COL].duplicated().any():
+    raise ValueError(
+        "File 2 must contain exactly one static "
+        "profile row per physician."
+    )
+
+# ============================================================
+# 6. MERGE FILE 1 + FILE 2
+# ============================================================
+
+rows_before = len(file1)
+
+merged = file1.merge(
+    file2,
+    on=ID_COL,
+    how="left",
+    validate="many_to_one"
+)
+
+if len(merged) != rows_before:
+    raise ValueError(
+        "Row count changed after merge. "
+        "Check physician IDs in File 2."
+    )
+
+print("\nMerged shape:", merged.shape)
+print(
+    "Unique physicians:",
+    merged[ID_COL].nunique()
+)
+
+# ============================================================
+# 7. TARGET STANDARDIZATION
+# ============================================================
+
+def convert_binary(series):
+
+    if pd.api.types.is_numeric_dtype(series):
+
+        return pd.to_numeric(
+            series,
+            errors="coerce"
+        )
+
+    mapping = {
+        "yes": 1,
+        "y": 1,
+        "true": 1,
+        "1": 1,
+        "adopted": 1,
+        "prescribed": 1,
+        "no": 0,
+        "n": 0,
+        "false": 0,
+        "0": 0,
+        "not adopted": 0,
+        "not_prescribed": 0
+    }
+
+    return (
+        series.astype(str)
+        .str.strip()
+        .str.lower()
+        .map(mapping)
+    )
+
+
+merged[TARGET_COL] = convert_binary(
+    merged[TARGET_COL]
+)
+
+if merged[TARGET_COL].isna().any():
+
+    print(
+        "WARNING: target contains missing/unmapped values:",
+        merged[TARGET_COL].isna().sum()
+    )
+
+# ============================================================
+# 8. CREATE PROPER QUARTER INDEX
+# ============================================================
+
+merged[QTR_COL] = (
+    merged[QTR_COL]
+    .astype(str)
+    .str.zfill(6)
+)
+
+merged["year"] = (
+    merged[QTR_COL]
+    .str[:4]
+    .astype(int)
+)
+
+merged["quarter_number"] = (
+    merged[QTR_COL]
+    .str[4:6]
+    .astype(int)
+)
+
+if not merged["quarter_number"].isin(
+    [1, 2, 3, 4]
+).all():
+
+    bad = sorted(
+        merged.loc[
+            ~merged["quarter_number"].isin(
+                [1, 2, 3, 4]
+            ),
+            QTR_COL
+        ].unique()
+    )
+
+    raise ValueError(
+        f"Invalid quarter values: {bad}"
+    )
+
+# Continuous quarter index
+merged["time_index"] = (
+    merged["year"] * 4
+    + merged["quarter_number"]
+)
+
+merged = (
+    merged
+    .sort_values(
+        [ID_COL, "time_index"]
+    )
+    .reset_index(drop=True)
+)
+
+# ============================================================
+# 9. CHECK PHYSICIAN QUARTER GAPS
+# ============================================================
+
+def check_gaps(data):
+
+    gap_records = []
+
+    for physician, group in data.groupby(ID_COL):
+
+        times = sorted(
+            group["time_index"]
+            .dropna()
+            .unique()
+        )
+
+        if len(times) > 1:
+
+            differences = np.diff(times)
+
+            if not np.all(
+                differences == 1
+            ):
+
+                gap_records.append({
+                    ID_COL: physician,
+                    "quarters": times,
+                    "gaps": differences[
+                        differences > 1
+                    ].tolist()
+                })
+
+    return pd.DataFrame(gap_records)
+
+
+gap_df = check_gaps(merged)
+
+print("\n" + "=" * 80)
+print("PHYSICIAN QUARTER GAP ANALYSIS")
+print("=" * 80)
+
+print(
+    "Physicians with gaps:",
+    len(gap_df)
+)
+
+print(
+    "Physicians without gaps:",
+    merged[ID_COL].nunique()
+    - len(gap_df)
+)
+
+# ============================================================
+# 10. CREATE LAG 1 AND LAG 2
+# ============================================================
+# IMPORTANT:
+# Lags are created on the FULL chronological panel.
+# We do NOT first remove adopters/non-adopters.
+#
+# This ensures Lag 1 genuinely means previous quarter
+# and Lag 2 genuinely means two quarters previously.
+
+# ============================================================
+
+LAG_NUMERIC = [
+    c for c in file1.select_dtypes(
+        include=np.number
+    ).columns
+    if c not in [
+        TARGET_COL
+    ]
+]
+
+# Remove ID if numeric
+LAG_NUMERIC = [
+    c for c in LAG_NUMERIC
+    if c != ID_COL
+]
+
+# Remove accidental calendar columns
+LAG_NUMERIC = [
+    c for c in LAG_NUMERIC
+    if c not in [
+        "year",
+        "quarter_number",
+        "time_index"
+    ]
+]
+
+print("\nNumeric activity columns:")
+print(LAG_NUMERIC)
+
+for col in LAG_NUMERIC:
+
+    merged[f"{col}_lag1"] = (
+        merged.groupby(ID_COL)[col]
+        .shift(1)
+    )
+
+    merged[f"{col}_lag2"] = (
+        merged.groupby(ID_COL)[col]
+        .shift(2)
+    )
+
+# ============================================================
+# 11. VALIDATE LAG CONTINUITY
+# ============================================================
+
+merged["previous_time_index"] = (
+    merged.groupby(ID_COL)
+    ["time_index"]
+    .shift(1)
+)
+
+merged["previous_previous_time_index"] = (
+    merged.groupby(ID_COL)
+    ["time_index"]
+    .shift(2)
+)
+
+merged["lag1_contiguous"] = (
+    merged["time_index"]
+    - merged["previous_time_index"]
+    == 1
+)
+
+merged["lag2_contiguous"] = (
+    merged["time_index"]
+    - merged["previous_previous_time_index"]
+    == 2
+)
+
+# Invalidate lag values if there is a gap
+for col in LAG_NUMERIC:
+
+    merged.loc[
+        ~merged["lag1_contiguous"],
+        f"{col}_lag1"
+    ] = np.nan
+
+    merged.loc[
+        ~merged["lag2_contiguous"],
+        f"{col}_lag2"
+    ] = np.nan
+
+# ============================================================
+# 12. CREATE NEXT-QUARTER TARGET
+# ============================================================
+# Business problem:
+#
+# Current physician is a non-adopter.
+# Previous 2 quarters are used as predictors.
+# Predict whether physician adopts in NEXT quarter.
+#
+# Example:
+#
+# Q8 = Lag 2
+# Q9 = Lag 1
+# Q10 = current source period
+# Q11 = target
+#
+# ============================================================
+
+next_time = (
+    merged.groupby(ID_COL)
+    ["time_index"]
+    .shift(-1)
+)
+
+next_target = (
+    merged.groupby(ID_COL)
+    [TARGET_COL]
+    .shift(-1)
+)
+
+merged["valid_next_quarter"] = (
+    next_time
+    == merged["time_index"] + 1
+)
+
+merged["target_next_qtr"] = np.where(
+    merged["valid_next_quarter"],
+    next_target,
+    np.nan
+)
+
+# ============================================================
+# 13. IDENTIFY CURRENT NON-ADOPTERS
+# ============================================================
+
+previous_adoption = (
+    merged.groupby(ID_COL)[TARGET_COL]
+    .cummax()
+    .groupby(merged[ID_COL])
+    .shift(1, fill_value=0)
+)
+
+merged["adopted_before"] = (
+    previous_adoption
+    .astype(int)
+)
+
+merged["is_non_adopter_now"] = (
+    merged["adopted_before"] == 0
+).astype(int)
+
+# ============================================================
+# 14. KEEP VALID MODELING OBSERVATIONS
+# ============================================================
+# We only model:
+#
+# 1. physician is currently non-adopter
+# 2. next quarter exists
+# 3. Lag 1 exists
+# 4. Lag 2 exists
+#
+# ============================================================
+
+model_data = merged[
+    (merged["is_non_adopter_now"] == 1)
+    & merged["target_next_qtr"].notna()
+    & merged["lag1_contiguous"]
+    & merged["lag2_contiguous"]
+].copy()
+
+model_data["target"] = (
+    model_data["target_next_qtr"]
+    .astype(int)
+)
+
+print("\n" + "=" * 80)
+print("MODELING DATA")
+print("=" * 80)
+
+print("Rows:", len(model_data))
+print(
+    "Physicians:",
+    model_data[ID_COL].nunique()
+)
+
+print(
+    "Target adoption rate:",
+    model_data["target"].mean()
+)
+
+print(
+    "Target counts:"
+)
+
+print(
+    model_data["target"]
+    .value_counts()
+)
+
+# ============================================================
+# 15. TRAIN / TEST SPLIT FIRST
+# ============================================================
+# IMPORTANT:
+# Split BEFORE EDA / feature selection / encoding.
+#
+# Test = latest target quarter
+# Train = all earlier target quarters
+#
+# Test remains completely untouched for modeling decisions.
+# ============================================================
+
+target_quarters = sorted(
+    model_data["time_index"].unique()
+)
+
+if len(target_quarters) < 3:
+    raise ValueError(
+        "Not enough quarters for train/test."
+    )
+
+TEST_TIME = target_quarters[-1]
+
+train_data = model_data[
+    model_data["time_index"]
+    < TEST_TIME
+].copy()
+
+test_data = model_data[
+    model_data["time_index"]
+    == TEST_TIME
+].copy()
+
+print("\n" + "=" * 80)
+print("TRAIN / TEST SPLIT")
+print("=" * 80)
+
+print(
+    "Train rows:",
+    len(train_data)
+)
+
+print(
+    "Test rows:",
+    len(test_data)
+)
+
+print(
+    "Train physicians:",
+    train_data[ID_COL].nunique()
+)
+
+print(
+    "Test physicians:",
+    test_data[ID_COL].nunique()
+)
+
+print(
+    "Train target rate:",
+    train_data["target"].mean()
+)
+
+print(
+    "Test target rate:",
+    test_data["target"].mean()
+)
+
+print(
+    "Test target quarter:",
+    TEST_TIME
+)
+
+# ============================================================
+# 16. BASIC EDA AFTER SPLIT
+# ============================================================
+# EDA is done separately.
+#
+# Descriptive EDA does not train a model.
+# But NO test statistics are used for feature selection.
+# ============================================================
+
+def basic_eda(data, name):
+
+    print("\n" + "=" * 80)
+    print(name)
+    print("=" * 80)
+
+    print("Shape:", data.shape)
+
+    print(
+        "Unique physicians:",
+        data[ID_COL].nunique()
+    )
+
+    print(
+        "Target distribution:"
+    )
+
+    print(
+        data["target"]
+        .value_counts()
+    )
+
+    print(
+        "\nTarget percentage:"
+    )
+
+    print(
+        data["target"]
+        .value_counts(
+            normalize=True
+        )
+        .mul(100)
+        .round(2)
+    )
+
+    missing = pd.DataFrame({
+        "missing_count": data.isna().sum(),
+        "missing_pct": (
+            data.isna().mean() * 100
+        ).round(2)
+    }).sort_values(
+        "missing_pct",
+        ascending=False
+    )
+
+    print("\nMissing values:")
+    print(missing)
+
+    numeric = data.select_dtypes(
+        include=np.number
+    ).columns.tolist()
+
+    print("\nNumeric summary:")
+    print(
+        data[numeric]
+        .describe()
+        .T
+        .round(2)
+    )
+
+    categorical = data.select_dtypes(
+        include=[
+            "object",
+            "category",
+            "bool"
+        ]
+    ).columns.tolist()
+
+    print("\nCategorical columns:")
+
+    for col in categorical:
+
+        if col in [
+            ID_COL,
+            QTR_COL
+        ]:
+            continue
+
+        print(
+            f"\n{col}:"
+        )
+
+        print(
+            data[col]
+            .value_counts(
+                dropna=False
+            )
+            .head(15)
+        )
+
+
+basic_eda(
+    train_data,
+    "TRAIN EDA"
+)
+
+basic_eda(
+    test_data,
+    "TEST EDA"
+)
+
+# ============================================================
+# 17. ADOPTION TREND - TRAIN
+# ============================================================
+
+train_trend = (
+    train_data
+    .groupby("time_index")
+    ["target"]
+    .agg(
+        adoption_rate="mean",
+        observations="count"
+    )
+    .reset_index()
+)
+
+train_trend["adoption_rate"] *= 100
+
+plt.figure(figsize=(10, 5))
+
+sns.lineplot(
+    data=train_trend,
+    x="time_index",
+    y="adoption_rate",
+    marker="o"
+)
+
+plt.title(
+    "Training Adoption Rate Trend"
+)
+
+plt.xlabel("Target Quarter Index")
+plt.ylabel("Adoption Rate (%)")
+plt.ylim(0, 100)
+
+plt.tight_layout()
+plt.show()
+
+# ============================================================
+# 18. ADOPTION TREND - TEST
+# ============================================================
+
+test_trend = (
+    test_data
+    .groupby("time_index")
+    ["target"]
+    .mean()
+    .mul(100)
+)
+
+print(
+    "\nTest adoption rate:",
+    test_trend
+)
+
+# ============================================================
+# 19. PREPARE RAW MODEL MATRICES
+# ============================================================
+
+DROP_COLS = [
+    ID_COL,
+    QTR_COL,
+    "target",
+    "target_next_qtr",
+    TARGET_COL,
+    "valid_next_quarter",
+    "adopted_before",
+    "is_non_adopter_now",
+    "previous_time_index",
+    "previous_previous_time_index",
+    "lag1_contiguous",
+    "lag2_contiguous",
+    "time_index"
+]
+
+DROP_COLS = [
+    c for c in DROP_COLS
+    if c in train_data.columns
+]
+
+X_train_raw = train_data.drop(
+    columns=DROP_COLS
+).copy()
+
+y_train = train_data["target"].copy()
+
+X_test_raw = test_data.drop(
+    columns=DROP_COLS
+).copy()
+
+y_test = test_data["target"].copy()
+
+# ============================================================
+# 20. REMOVE PHYSICIAN GENDER
+# ============================================================
+# User specifically requested physician gender not be used.
+
+gender_cols = [
+    c for c in X_train_raw.columns
+    if "gender" in c.lower()
+]
+
+print(
+    "\nRemoving gender columns:",
+    gender_cols
+)
+
+X_train_raw = X_train_raw.drop(
+    columns=gender_cols,
+    errors="ignore"
+)
+
+X_test_raw = X_test_raw.drop(
+    columns=gender_cols,
+    errors="ignore"
+)
+
+# ============================================================
+# 21. REMOVE OTHER IDENTIFIERS
+# ============================================================
+
+identifier_cols = [
+    c for c in X_train_raw.columns
+    if any(
+        token in c.lower()
+        for token in [
+            "physician_id",
+            "hcp_id",
+            "npi"
+        ]
+    )
+]
+
+X_train_raw = X_train_raw.drop(
+    columns=identifier_cols,
+    errors="ignore"
+)
+
+X_test_raw = X_test_raw.drop(
+    columns=identifier_cols,
+    errors="ignore"
+)
+
+# ============================================================
+# 22. TRAIN-ONLY NUMERIC / CATEGORICAL IDENTIFICATION
+# ============================================================
+
+numeric_features = (
+    X_train_raw
+    .select_dtypes(
+        include=np.number
+    )
+    .columns
+    .tolist()
+)
+
+categorical_features = (
+    X_train_raw
+    .select_dtypes(
+        include=[
+            "object",
+            "category",
+            "bool"
+        ]
+    )
+    .columns
+    .tolist()
+)
+
+print(
+    "\nRaw numeric features:",
+    len(numeric_features)
+)
+
+print(
+    "Raw categorical features:",
+    len(categorical_features)
+)
+
+# ============================================================
+# 23. TRAIN-ONLY CORRELATION ANALYSIS
+# ============================================================
+# IMPORTANT:
+# Correlation is calculated ONLY using TRAIN.
+#
+# Test is NOT used to decide which feature to remove.
+# ============================================================
+
+train_numeric = X_train_raw[
+    numeric_features
+].copy()
+
+train_numeric = train_numeric.replace(
+    [np.inf, -np.inf],
+    np.nan
+)
+
+train_numeric = train_numeric.fillna(
+    train_numeric.median()
+)
+
+correlation = train_numeric.corr()
+
+plt.figure(
+    figsize=(
+        max(10, len(numeric_features) * 0.5),
+        max(8, len(numeric_features) * 0.4)
+    )
+)
+
+sns.heatmap(
+    correlation,
+    cmap="coolwarm",
+    center=0
+)
+
+plt.title(
+    "TRAIN-ONLY Numeric Correlation"
+)
+
+plt.tight_layout()
+plt.show()
+
+# ============================================================
+# 24. REMOVE HIGHLY CORRELATED FEATURES
+# ============================================================
+
+upper = correlation.abs().where(
+    np.triu(
+        np.ones(
+            correlation.shape
+        ),
+        k=1
+    ).astype(bool)
+)
+
+# Correlation with target
+target_corr = {}
+
+for col in numeric_features:
+
+    value = train_numeric[col].corr(
+        y_train
+    )
+
+    target_corr[col] = (
+        abs(value)
+        if pd.notna(value)
+        else 0
+    )
+
+drop_corr = set()
+
+for col in upper.columns:
+
+    for other in upper.index:
+
+        if (
+            pd.notna(upper.loc[other, col])
+            and
+            upper.loc[other, col]
+            >= CORR_THRESHOLD
+        ):
+
+            # Keep the variable more associated
+            # with the target.
+            if (
+                target_corr[col]
+                >= target_corr[other]
+            ):
+                drop_corr.add(other)
+
+            else:
+                drop_corr.add(col)
+
+corr_features = [
+    c for c in numeric_features
+    if c not in drop_corr
+]
+
+print(
+    "\nRemoved because of high correlation:"
+)
+
+print(
+    sorted(drop_corr)
+)
+
+print(
+    "Remaining numeric features:",
+    len(corr_features)
+)
+
+# ============================================================
+# 25. TRAIN-ONLY VIF
+# ============================================================
+
+vif_data = train_numeric[
+    corr_features
+].copy()
+
+vif_records = []
+
+for i, col in enumerate(
+    vif_data.columns
+):
+
+    try:
+
+        value = variance_inflation_factor(
+            vif_data.values,
+            i
+        )
+
+    except Exception:
+
+        value = np.inf
+
+    vif_records.append({
+        "feature": col,
+        "VIF": value
+    })
+
+vif_df = (
+    pd.DataFrame(vif_records)
+    .sort_values(
+        "VIF",
+        ascending=False
+    )
+)
+
+print("\n" + "=" * 80)
+print("TRAIN-ONLY VIF")
+print("=" * 80)
+
+print(
+    vif_df.round(3)
+    .to_string(index=False)
+)
+
+high_vif_features = set(
+    vif_df.loc[
+        vif_df["VIF"] > VIF_THRESHOLD,
+        "feature"
+    ]
+)
+
+# Remove high-VIF features
+# only after correlation filtering.
+
+corr_features = [
+    c for c in corr_features
+    if c not in high_vif_features
+]
+
+print(
+    "\nRemoved due to VIF >",
+    VIF_THRESHOLD,
+    ":"
+)
+
+print(
+    sorted(high_vif_features)
+)
+
+# ============================================================
+# 26. RANK NUMERIC FEATURES BY TRAIN TARGET ASSOCIATION
+# ============================================================
+
+ranked_numeric = sorted(
+    corr_features,
+    key=lambda x: target_corr.get(
+        x,
+        0
+    ),
+    reverse=True
+)
+
+selected_numeric = ranked_numeric[
+    :MAX_NUMERIC_FEATURES
+]
+
+print("\nSelected numeric features:")
+
+for i, col in enumerate(
+    selected_numeric,
+    1
+):
+
+    print(
+        i,
+        col,
+        "target corr:",
+        round(
+            target_corr[col],
+            4
+        )
+    )
+
+# ============================================================
+# 27. SELECT CATEGORICAL FEATURES
+# ============================================================
+# Select only low-cardinality meaningful categorical
+# variables.
+#
+# High-cardinality physician identifiers are already removed.
+# ============================================================
+
+categorical_candidates = []
+
+for col in categorical_features:
+
+    nunique = (
+        X_train_raw[col]
+        .nunique(
+            dropna=True
+        )
+    )
+
+    if (
+        2 <= nunique <= 15
+    ):
+
+        categorical_candidates.append(
+            col
+        )
+
+# Rank categorical variables by
+# target adoption difference.
+
+categorical_scores = []
+
+for col in categorical_candidates:
+
+    temp = pd.DataFrame({
+        "x": X_train_raw[col],
+        "y": y_train
+    })
+
+    rate = (
+        temp.groupby("x")["y"]
+        .mean()
+    )
+
+    if len(rate) > 1:
+
+        score = (
+            rate.max()
+            - rate.min()
+        )
+
+    else:
+
+        score = 0
+
+    categorical_scores.append(
+        (
+            col,
+            score
+        )
+    )
+
+categorical_scores = sorted(
+    categorical_scores,
+    key=lambda x: x[1],
+    reverse=True
+)
+
+selected_categorical = [
+    x[0]
+    for x in categorical_scores[
+        :MAX_CATEGORICAL_FEATURES
+    ]
+]
+
+print(
+    "\nSelected categorical features:"
+)
+
+print(
+    selected_categorical
+)
+
+# ============================================================
+# 28. FINAL FEATURE LIST
+# ============================================================
+
+FEATURES = (
+    selected_numeric
+    + selected_categorical
+)
+
+# Explicitly ensure gender is not present
+FEATURES = [
+    c for c in FEATURES
+    if "gender" not in c.lower()
+]
+
+print("\n" + "=" * 80)
+print("FINAL FEATURE LIST")
+print("=" * 80)
+
+for i, feature in enumerate(
+    FEATURES,
+    1
+):
+
+    print(
+        i,
+        feature
+    )
+
+print(
+    "\nTotal raw model features:",
+    len(FEATURES)
+)
+
+print(
+    "Numeric:",
+    len(
+        [
+            c for c in FEATURES
+            if c in selected_numeric
+        ]
+    )
+)
+
+print(
+    "Categorical:",
+    len(
+        [
+            c for c in FEATURES
+            if c in selected_categorical
+        ]
+    )
+)
+
+# ============================================================
+# 29. APPLY SAME FEATURE LIST TO TRAIN AND TEST
+# ============================================================
+
+X_train = X_train_raw[
+    FEATURES
+].copy()
+
+X_test = X_test_raw[
+    FEATURES
+].copy()
+
+# ============================================================
+# 30. CHECK TRAIN / TEST FEATURE ALIGNMENT
+# ============================================================
+
+assert (
+    list(X_train.columns)
+    == list(X_test.columns)
+)
+
+print(
+    "\nTrain/test feature alignment verified."
+)
+
+# ============================================================
+# 31. PREPROCESSOR
+# ============================================================
+# This object is FIT only within each CV fold.
+# Therefore:
+#
+# Median imputation -> training fold only
+# One-hot encoding -> training fold only
+# Scaling -> training fold only
+#
+# Test never influences these transformations.
+# ============================================================
+
+numeric_features = [
+    c for c in FEATURES
+    if c in selected_numeric
+]
+
+categorical_features = [
+    c for c in FEATURES
+    if c in selected_categorical
+]
+
+def make_preprocessor():
+
+    numeric_pipeline = SkPipeline(
+        steps=[
+            (
+                "imputer",
+                SimpleImputer(
+                    strategy="median"
+                )
+            ),
+            (
+                "scaler",
+                StandardScaler()
+            )
+        ]
+    )
+
+    categorical_pipeline = SkPipeline(
+        steps=[
+            (
+                "imputer",
+                SimpleImputer(
+                    strategy="most_frequent"
+                )
+            ),
+            (
+                "onehot",
+                OneHotEncoder(
+                    handle_unknown="ignore",
+                    sparse_output=False
+                )
+            )
+        ]
+    )
+
+    return ColumnTransformer(
+        transformers=[
+            (
+                "num",
+                numeric_pipeline,
+                numeric_features
+            ),
+            (
+                "cat",
+                categorical_pipeline,
+                categorical_features
+            )
+        ],
+        remainder="drop"
+    )
+
+# ============================================================
+# 32. STRATIFIED GROUP K-FOLD
+# ============================================================
+# Stratification:
+#   preserves target balance as much as possible.
+#
+# Group:
+#   physician_id cannot appear in both train and validation
+#   fold.
+#
+# This is better than ordinary StratifiedKFold for repeated
+# physician-quarter observations.
+# ============================================================
+
+cv = StratifiedGroupKFold(
+    n_splits=N_SPLITS,
+    shuffle=True,
+    random_state=RANDOM_STATE
+)
+
+groups_train = train_data[
+    ID_COL
+].values
+
+# ============================================================
+# 33. MODEL FACTORY
+# ============================================================
+
+def create_model(
+    model_name,
+    params=None
+):
+
+    params = params or {}
+
+    if model_name == "xgboost":
+
+        return XGBClassifier(
+            **params,
+            objective="binary:logistic",
+            eval_metric="logloss",
+            random_state=RANDOM_STATE,
+            n_jobs=-1
+        )
+
+    if model_name == "lightgbm":
+
+        return LGBMClassifier(
+            **params,
+            objective="binary",
+            random_state=RANDOM_STATE,
+            n_jobs=-1,
+            verbosity=-1
+        )
+
+    raise ValueError(
+        f"Unknown model: {model_name}"
+    )
+
+# ============================================================
+# 34. OPTUNA OBJECTIVE
+# ============================================================
+# SMOTE is INSIDE the pipeline.
+#
+# Therefore every CV fold performs:
+#
+# train fold
+#   -> impute
+#   -> encode
+#   -> SMOTE
+#   -> model
+#
+# Validation fold NEVER gets SMOTE.
+# ============================================================
+
+def optuna_objective(
+    trial,
+    model_name
+):
+
+    if model_name == "xgboost":
+
+        params = {
+
+            "n_estimators":
+                trial.suggest_int(
+                    "n_estimators",
+                    100,
+                    300,
+                    step=50
+                ),
+
+            "max_depth":
+                trial.suggest_int(
+                    "max_depth",
+                    2,
+                    5
+                ),
+
+            "learning_rate":
+                trial.suggest_float(
+                    "learning_rate",
+                    0.03,
+                    0.15,
+                    log=True
+                ),
+
+            "min_child_weight":
+                trial.suggest_int(
+                    "min_child_weight",
+                    2,
+                    10
+                ),
+
+            "subsample":
+                trial.suggest_float(
+                    "subsample",
+                    0.70,
+                    0.95
+                ),
+
+            "colsample_bytree":
+                trial.suggest_float(
+                    "colsample_bytree",
+                    0.70,
+                    0.95
+                ),
+
+            "gamma":
+                trial.suggest_float(
+                    "gamma",
+                    0,
+                    2
+                ),
+
+            "reg_alpha":
+                trial.suggest_float(
+                    "reg_alpha",
+                    1e-3,
+                    2,
+                    log=True
+                ),
+
+            "reg_lambda":
+                trial.suggest_float(
+                    "reg_lambda",
+                    0.1,
+                    10,
+                    log=True
+                )
+        }
+
+    elif model_name == "lightgbm":
+
+        params = {
+
+            "n_estimators":
+                trial.suggest_int(
+                    "n_estimators",
+                    100,
+                    300,
+                    step=50
+                ),
+
+            "num_leaves":
+                trial.suggest_int(
+                    "num_leaves",
+                    7,
+                    31
+                ),
+
+            "max_depth":
+                trial.suggest_int(
+                    "max_depth",
+                    2,
+                    7
+                ),
+
+            "learning_rate":
+                trial.suggest_float(
+                    "learning_rate",
+                    0.03,
+                    0.15,
+                    log=True
+                ),
+
+            "min_child_samples":
+                trial.suggest_int(
+                    "min_child_samples",
+                    10,
+                    50
+                ),
+
+            "subsample":
+                trial.suggest_float(
+                    "subsample",
+                    0.70,
+                    0.95
+                ),
+
+            "colsample_bytree":
+                trial.suggest_float(
+                    "colsample_bytree",
+                    0.70,
+                    0.95
+                ),
+
+            "reg_alpha":
+                trial.suggest_float(
+                    "reg_alpha",
+                    1e-3,
+                    2,
+                    log=True
+                ),
+
+            "reg_lambda":
+                trial.suggest_float(
+                    "reg_lambda",
+                    0.1,
+                    10,
+                    log=True
+                )
+        }
+
+    else:
+
+        raise ValueError(
+            "Invalid model."
+        )
+
+    model = create_model(
+        model_name,
+        params
+    )
+
+    pipeline = Pipeline(
+        steps=[
+            (
+                "preprocessor",
+                make_preprocessor()
+            ),
+
+            (
+                "smote",
+                SMOTE(
+                    random_state=RANDOM_STATE,
+                    k_neighbors=5
+                )
+            ),
+
+            (
+                "model",
+                model
+            )
+        ]
+    )
+
+    scores = cross_val_score(
+        pipeline,
+        X_train,
+        y_train,
+        groups=groups_train,
+        cv=cv,
+        scoring="average_precision",
+        n_jobs=1
+    )
+
+    return scores.mean()
+
+# ============================================================
+# 35. RUN OPTUNA - ONLY 2 MODELS
+# ============================================================
+
+MODEL_NAMES = [
+    "xgboost",
+    "lightgbm"
+]
+
+best_params = {}
+optuna_scores = {}
+
+for model_name in MODEL_NAMES:
+
+    print(
+        "\n" + "=" * 80
+    )
+
+    print(
+        "OPTUNA:",
+        model_name.upper()
+    )
+
+    print("=" * 80)
+
+    study = optuna.create_study(
+        direction="maximize",
+        sampler=optuna.samplers.TPESampler(
+            seed=RANDOM_STATE
+        )
+    )
+
+    study.optimize(
+        lambda trial:
+            optuna_objective(
+                trial,
+                model_name
+            ),
+        n_trials=N_TRIALS,
+        show_progress_bar=True
+    )
+
+    best_params[
+        model_name
+    ] = study.best_params
+
+    optuna_scores[
+        model_name
+    ] = study.best_value
+
+    print(
+        "Best CV PR-AUC:",
+        round(
+            study.best_value,
+            4
+        )
+    )
+
+    print(
+        "Best parameters:"
+    )
+
+    print(
+        study.best_params
+    )
+
+# ============================================================
+# 36. OPTUNA SUMMARY
+# ============================================================
+
+optuna_summary = pd.DataFrame({
+    "Model": list(
+        optuna_scores.keys()
+    ),
+    "CV_PR_AUC": list(
+        optuna_scores.values()
+    )
+})
+
+print(
+    "\n" + "=" * 80
+)
+
+print(
+    "OPTUNA SUMMARY"
+)
+
+print("=" * 80)
+
+print(
+    optuna_summary
+    .sort_values(
+        "CV_PR_AUC",
+        ascending=False
+    )
+    .round(4)
+    .to_string(index=False)
+)
+
+# ============================================================
+# 37. CREATE FINAL TUNED PIPELINES
+# ============================================================
+
+models = {}
+
+for model_name in MODEL_NAMES:
+
+    model = create_model(
+        model_name,
+        best_params[
+            model_name
+        ].copy()
+    )
+
+    models[model_name] = Pipeline(
+        steps=[
+            (
+                "preprocessor",
+                make_preprocessor()
+            ),
+
+            (
+                "smote",
+                SMOTE(
+                    random_state=RANDOM_STATE,
+                    k_neighbors=5
+                )
+            ),
+
+            (
+                "model",
+                model
+            )
+        ]
+    )
+
+# ============================================================
+# 38. FIT MODELS ON TRAIN
+# ============================================================
+
+for name, model in models.items():
+
+    print(
+        "\nTraining:",
+        name
+    )
+
+    model.fit(
+        X_train,
+        y_train
+    )
+
+print(
+    "\nBoth models trained successfully."
+)
+
+# ============================================================
+# 39. TRAIN OOF PREDICTIONS
+# ============================================================
+# Used for:
+#   - validation performance
+#   - threshold selection
+#
+# The threshold is NOT optimized on the test set.
+# ============================================================
+
+def generate_oof_predictions(
+    model_name
+):
+
+    oof_probability = np.zeros(
+        len(X_train)
+    )
+
+    for fold, (
+        train_idx,
+        valid_idx
+    ) in enumerate(
+        cv.split(
+            X_train,
+            y_train,
+            groups_train
+        ),
+        1
+    ):
+
+        X_tr = X_train.iloc[
+            train_idx
+        ]
+
+        y_tr = y_train.iloc[
+            train_idx
+        ]
+
+        X_va = X_train.iloc[
+            valid_idx
+        ]
+
+        model = create_model(
+            model_name,
+            best_params[
+                model_name
+            ].copy()
+        )
+
+        fold_pipeline = Pipeline(
+            steps=[
+                (
+                    "preprocessor",
+                    make_preprocessor()
+                ),
+
+                (
+                    "smote",
+                    SMOTE(
+                        random_state=RANDOM_STATE,
+                        k_neighbors=5
+                    )
+                ),
+
+                (
+                    "model",
+                    model
+                )
+            ]
+        )
+
+        fold_pipeline.fit(
+            X_tr,
+            y_tr
+        )
+
+        oof_probability[
+            valid_idx
+        ] = fold_pipeline.predict_proba(
+            X_va
+        )[:, 1]
+
+        print(
+            model_name,
+            "fold",
+            fold,
+            "completed."
+        )
+
+    return oof_probability
+
+oof_predictions = {}
+
+for model_name in MODEL_NAMES:
+
+    oof_predictions[
+        model_name
+    ] = generate_oof_predictions(
+        model_name
+    )
+
+# ============================================================
+# 40. RECALL-AWARE THRESHOLD SELECTION
+# ============================================================
+# Threshold is selected from OOF TRAIN predictions ONLY.
+#
+# We maximize F2:
+#   Recall receives more importance than Precision.
+#
+# Precision floor prevents threshold from becoming
+# unrealistically low.
+# ============================================================
+
+def select_threshold(
+    y_true,
+    probabilities,
+    min_precision=0.25
+):
+
+    thresholds = np.arange(
+        0.10,
+        0.71,
+        0.01
+    )
+
+    records = []
+
+    for threshold in thresholds:
+
+        predictions = (
+            probabilities >= threshold
+        ).astype(int)
+
+        precision = precision_score(
+            y_true,
+            predictions,
+            zero_division=0
+        )
+
+        recall = recall_score(
+            y_true,
+            predictions,
+            zero_division=0
+        )
+
+        f1 = f1_score(
+            y_true,
+            predictions,
+            zero_division=0
+        )
+
+        # F2
+        f2 = (
+            5 * precision * recall
+            /
+            (
+                4 * precision
+                + recall
+            )
+            if (
+                4 * precision
+                + recall
+            ) > 0
+            else 0
+        )
+
+        records.append({
+            "threshold": threshold,
+            "precision": precision,
+            "recall": recall,
+            "f1": f1,
+            "f2": f2
+        })
+
+    threshold_df = pd.DataFrame(
+        records
+    )
+
+    eligible = threshold_df[
+        threshold_df["precision"]
+        >= min_precision
+    ]
+
+    if len(eligible) == 0:
+
+        eligible = threshold_df
+
+    best = (
+        eligible
+        .sort_values(
+            [
+                "f2",
+                "recall",
+                "precision"
+            ],
+            ascending=False
+        )
+        .iloc[0]
+    )
+
+    return (
+        float(best["threshold"]),
+        threshold_df
+    )
+
+thresholds = {}
+threshold_tables = {}
+
+for model_name in MODEL_NAMES:
+
+    threshold, threshold_df = (
+        select_threshold(
+            y_train,
+            oof_predictions[
+                model_name
+            ]
+        )
+    )
+
+    thresholds[
+        model_name
+    ] = threshold
+
+    threshold_tables[
+        model_name
+    ] = threshold_df
+
+    print(
+        "\n",
+        model_name,
+        "OOF threshold:",
+        round(
+            threshold,
+            3
+        )
+    )
+
+# ============================================================
+# 41. EVALUATION FUNCTION
+# ============================================================
+
+def calculate_metrics(
+    y_true,
+    probability,
+    threshold
+):
+
+    prediction = (
+        probability >= threshold
+    ).astype(int)
+
+    cm = confusion_matrix(
+        y_true,
+        prediction,
+        labels=[0, 1]
+    )
+
+    tn, fp, fn, tp = (
+        cm.ravel()
+    )
+
+    specificity = (
+        tn / (tn + fp)
+        if (tn + fp) > 0
+        else 0
+    )
+
+    sensitivity = (
+        tp / (tp + fn)
+        if (tp + fn) > 0
+        else 0
+    )
+
+    return {
+        "Accuracy":
+            accuracy_score(
+                y_true,
+                prediction
+            ),
+
+        "Precision":
+            precision_score(
+                y_true,
+                prediction,
+                zero_division=0
+            ),
+
+        "Recall":
+            recall_score(
+                y_true,
+                prediction,
+                zero_division=0
+            ),
+
+        "Sensitivity":
+            sensitivity,
+
+        "Specificity":
+            specificity,
+
+        "F1":
+            f1_score(
+                y_true,
+                prediction,
+                zero_division=0
+            ),
+
+        "ROC_AUC":
+            roc_auc_score(
+                y_true,
+                probability
+            ),
+
+        "PR_AUC":
+            average_precision_score(
+                y_true,
+                probability
+            ),
+
+        "Brier_Score":
+            brier_score_loss(
+                y_true,
+                probability
+            ),
+
+        "Threshold":
+            threshold
+    }
+
+# ============================================================
+# 42. PREDICTIONS
+# ============================================================
+
+all_predictions = {}
+
+for model_name, model in models.items():
+
+    all_predictions[
+        model_name
+    ] = {
+
+        "Train_OOF":
+            oof_predictions[
+                model_name
+            ],
+
+        "Train_Fitted":
+            model.predict_proba(
+                X_train
+            )[:, 1],
+
+        "Test":
+            model.predict_proba(
+                X_test
+            )[:, 1]
+    }
+
+# ============================================================
+# 43. MODEL PERFORMANCE
+# ============================================================
+
+results = []
+
+for model_name in MODEL_NAMES:
+
+    threshold = thresholds[
+        model_name
+    ]
+
+    # OOF = proper validation-like estimate
+    train_metrics = calculate_metrics(
+        y_train,
+        all_predictions[
+            model_name
+        ]["Train_OOF"],
+        threshold
+    )
+
+    test_metrics = calculate_metrics(
+        y_test,
+        all_predictions[
+            model_name
+        ]["Test"],
+        threshold
+    )
+
+    train_metrics[
+        "Model"
+    ] = model_name
+
+    train_metrics[
+        "Dataset"
+    ] = "OOF_Train"
+
+    test_metrics[
+        "Model"
+    ] = model_name
+
+    test_metrics[
+        "Dataset"
+    ] = "Test"
+
+    results.append(
+        train_metrics
+    )
+
+    results.append(
+        test_metrics
+    )
+
+results_df = pd.DataFrame(
+    results
+)
+
+result_columns = [
+    "Model",
+    "Dataset",
+    "Accuracy",
+    "Precision",
+    "Recall",
+    "Sensitivity",
+    "Specificity",
+    "F1",
+    "ROC_AUC",
+    "PR_AUC",
+    "Brier_Score",
+    "Threshold"
+]
+
+results_df = results_df[
+    result_columns
+]
+
+print(
+    "\n" + "=" * 80
+)
+
+print(
+    "MODEL PERFORMANCE"
+)
+
+print("=" * 80)
+
+print(
+    results_df.round(4)
+    .to_string(index=False)
+)
+
+# ============================================================
+# 44. OVERFITTING ANALYSIS
+# ============================================================
+
+overfitting = []
+
+for model_name in MODEL_NAMES:
+
+    train_prob = all_predictions[
+        model_name
+    ]["Train_Fitted"]
+
+    oof_prob = all_predictions[
+        model_name
+    ]["Train_OOF"]
+
+    test_prob = all_predictions[
+        model_name
+    ]["Test"]
+
+    train_auc = roc_auc_score(
+        y_train,
+        train_prob
+    )
+
+    oof_auc = roc_auc_score(
+        y_train,
+        oof_prob
+    )
+
+    test_auc = roc_auc_score(
+        y_test,
+        test_prob
+    )
+
+    train_pr = average_precision_score(
+        y_train,
+        train_prob
+    )
+
+    oof_pr = average_precision_score(
+        y_train,
+        oof_prob
+    )
+
+    test_pr = average_precision_score(
+        y_test,
+        test_prob
+    )
+
+    overfitting.append({
+
+        "Model":
+            model_name,
+
+        "Train_ROC_AUC":
+            train_auc,
+
+        "OOF_ROC_AUC":
+            oof_auc,
+
+        "Test_ROC_AUC":
+            test_auc,
+
+        "Train_OOF_ROC_Gap":
+            train_auc - oof_auc,
+
+        "OOF_Test_ROC_Gap":
+            oof_auc - test_auc,
+
+        "Train_PR_AUC":
+            train_pr,
+
+        "OOF_PR_AUC":
+            oof_pr,
+
+        "Test_PR_AUC":
+            test_pr,
+
+        "Train_OOF_PR_Gap":
+            train_pr - oof_pr,
+
+        "OOF_Test_PR_Gap":
+            oof_pr - test_pr
+    })
+
+overfitting_df = pd.DataFrame(
+    overfitting
+)
+
+print(
+    "\n" + "=" * 80
+)
+
+print(
+    "OVERFITTING ANALYSIS"
+)
+
+print("=" * 80)
+
+print(
+    overfitting_df.round(4)
+    .to_string(index=False)
+)
+
+# ============================================================
+# 45. MODEL COMPARISON
+# ============================================================
+
+model_comparison = (
+    results_df
+    .pivot(
+        index="Model",
+        columns="Dataset",
+        values="PR_AUC"
+    )
+    .reset_index()
+)
+
+print(
+    "\nPR-AUC comparison:"
+)
+
+print(
+    model_comparison.round(4)
+)
+
+# Select based primarily on OOF PR-AUC,
+# not final test performance.
+best_model_name = (
+    results_df[
+        results_df["Dataset"]
+        == "OOF_Train"
+    ]
+    .sort_values(
+        "PR_AUC",
+        ascending=False
+    )
+    .iloc[0]["Model"]
+)
+
+print(
+    "\nSelected model:",
+    best_model_name
+)
+
+# ============================================================
+# 46. TEST CONFUSION MATRIX
+# ============================================================
+
+best_test_probability = (
+    all_predictions[
+        best_model_name
+    ]["Test"]
+)
+
+best_threshold = thresholds[
+    best_model_name
+]
+
+best_test_prediction = (
+    best_test_probability
+    >= best_threshold
+).astype(int)
+
+cm = confusion_matrix(
+    y_test,
+    best_test_prediction,
+    labels=[0, 1]
+)
+
+plt.figure(
+    figsize=(6, 5)
+)
+
+sns.heatmap(
+    cm,
+    annot=True,
+    fmt="d",
+    cmap="Blues",
+    xticklabels=[
+        "Non-Adopter",
+        "Adopter"
+    ],
+    yticklabels=[
+        "Non-Adopter",
+        "Adopter"
+    ]
+)
+
+plt.title(
+    f"{best_model_name} - Test Confusion Matrix"
+)
+
+plt.xlabel(
+    "Predicted"
+)
+
+plt.ylabel(
+    "Actual"
+)
+
+plt.tight_layout()
+plt.show()
+
+print(
+    classification_report(
+        y_test,
+        best_test_prediction,
+        target_names=[
+            "Non-Adopter",
+            "Adopter"
+        ],
+        zero_division=0
+    )
+)
+
+# ============================================================
+# 47. THRESHOLD CURVE
+# ============================================================
+
+threshold_df = threshold_tables[
+    best_model_name
+]
+
+plt.figure(
+    figsize=(9, 5)
+)
+
+plt.plot(
+    threshold_df["threshold"],
+    threshold_df["recall"],
+    label="Recall"
+)
+
+plt.plot(
+    threshold_df["threshold"],
+    threshold_df["precision"],
+    label="Precision"
+)
+
+plt.plot(
+    threshold_df["threshold"],
+    threshold_df["f2"],
+    label="F2"
+)
+
+plt.axvline(
+    best_threshold,
+    linestyle="--",
+    label="Selected Threshold"
+)
+
+plt.xlabel(
+    "Threshold"
+)
+
+plt.ylabel(
+    "Metric"
+)
+
+plt.title(
+    "Recall-Aware Threshold Selection"
+)
+
+plt.legend()
+
+plt.tight_layout()
+plt.show()
+
+# ============================================================
+# 48. NATIVE FEATURE IMPORTANCE
+# ============================================================
+
+best_model = models[
+    best_model_name
+]
+
+fitted_preprocessor = (
+    best_model
+    .named_steps[
+        "preprocessor"
+    ]
+)
+
+trained_model = (
+    best_model
+    .named_steps[
+        "model"
+    ]
+)
+
+feature_names = (
+    fitted_preprocessor
+    .get_feature_names_out()
+)
+
+if hasattr(
+    trained_model,
+    "feature_importances_"
+):
+
+    importance_df = pd.DataFrame({
+
+        "feature":
+            feature_names,
+
+        "importance":
+            trained_model
+            .feature_importances_
+    })
+
+    importance_df = (
+        importance_df
+        .sort_values(
+            "importance",
+            ascending=False
+        )
+    )
+
+    print(
+        "\n" + "=" * 80
+    )
+
+    print(
+        "FEATURE IMPORTANCE"
+    )
+
+    print("=" * 80)
+
+    print(
+        importance_df
+        .head(25)
+        .to_string(index=False)
+    )
+
+    plt.figure(
+        figsize=(10, 7)
+    )
+
+    top_importance = (
+        importance_df
+        .head(20)
+        .sort_values(
+            "importance"
+        )
+    )
+
+    sns.barplot(
+        data=top_importance,
+        x="importance",
+        y="feature"
+    )
+
+    plt.title(
+        f"{best_model_name} Feature Importance"
+    )
+
+    plt.tight_layout()
+    plt.show()
+
+# ============================================================
+# 49. SHAP
+# ============================================================
+# SHAP is performed after model fitting.
+#
+# It explains the final selected model.
+# ============================================================
+
+try:
+
+    X_shap = X_test.sample(
+        min(
+            500,
+            len(X_test)
+        ),
+        random_state=RANDOM_STATE
+    )
+
+    X_shap_transformed = (
+        fitted_preprocessor
+        .transform(X_shap)
+    )
+
+    explainer = shap.TreeExplainer(
+        trained_model
+    )
+
+    shap_values = (
+        explainer.shap_values(
+            X_shap_transformed
+        )
+    )
+
+    if isinstance(
+        shap_values,
+        list
+    ):
+
+        shap_plot_values = (
+            shap_values[1]
+        )
+
+    elif getattr(
+        shap_values,
+        "ndim",
+        2
+    ) == 3:
+
+        shap_plot_values = (
+            shap_values[:, :, 1]
+        )
+
+    else:
+
+        shap_plot_values = (
+            shap_values
+        )
+
+    shap.summary_plot(
+        shap_plot_values,
+        X_shap_transformed,
+        feature_names=feature_names,
+        max_display=20,
+        show=False
+    )
+
+    plt.title(
+        f"SHAP Summary - {best_model_name}"
+    )
+
+    plt.tight_layout()
+    plt.show()
+
+except Exception as e:
+
+    print(
+        "SHAP could not be generated:",
+        e
+    )
+
+# ============================================================
+# 50. FINAL MODEL RETRAINING
+# ============================================================
+# After model selection and historical test evaluation,
+# retrain on all labeled historical observations.
+#
+# This step is ONLY for the final business prediction.
+# ============================================================
+
+all_X = pd.concat(
+    [
+        X_train,
+        X_test
+    ],
+    axis=0
+)
+
+all_y = pd.concat(
+    [
+        y_train,
+        y_test
+    ],
+    axis=0
+)
+
+final_model = Pipeline(
+    steps=[
+        (
+            "preprocessor",
+            make_preprocessor()
+        ),
+
+        (
+            "smote",
+            SMOTE(
+                random_state=RANDOM_STATE,
+                k_neighbors=5
+            )
+        ),
+
+        (
+            "model",
+            create_model(
+                best_model_name,
+                best_params[
+                    best_model_name
+                ].copy()
+            )
+        )
+    ]
+)
+
+final_model.fit(
+    all_X,
+    all_y
+)
+
+print(
+    "\nFinal model retrained on all labeled history."
+)
+
+# ============================================================
+# 51. FINAL OUTPUT
+# ============================================================
+# Historical test predictions
+# ============================================================
+
+final_test_probability = (
+    final_model
+    .predict_proba(
+        X_test
+    )[:, 1]
+)
+
+final_predictions = pd.DataFrame({
+
+    ID_COL:
+        test_data[
+            ID_COL
+        ].values,
+
+    "target_quarter":
+        test_data[
+            QTR_COL
+        ].values,
+
+    "actual_adoption":
+        y_test.values,
+
+    "predicted_probability":
+        final_test_probability,
+
+    "predicted_adoption":
+        (
+            final_test_probability
+            >= best_threshold
+        ).astype(int)
+})
+
+final_predictions = (
+    final_predictions
+    .sort_values(
+        "predicted_probability",
+        ascending=False
+    )
+    .reset_index(drop=True)
+)
+
+final_predictions[
+    "rank"
+] = np.arange(
+    1,
+    len(final_predictions) + 1
+)
+
+print(
+    "\nFinal prediction sample:"
+)
+
+print(
+    final_predictions
+    .head(20)
+    .to_string(index=False)
+)
+
+# ============================================================
+# 52. EXPORT
+# ============================================================
+
+results_df.to_csv(
+    "model_performance.csv",
+    index=False
+)
+
+overfitting_df.to_csv(
+    "overfitting_analysis.csv",
+    index=False
+)
+
+vif_df.to_csv(
+    "train_only_vif.csv",
+    index=False
+)
+
+importance_df.to_csv(
+    "feature_importance.csv",
+    index=False
+)
+
+final_predictions.to_csv(
+    "physician_adoption_predictions.csv",
+    index=False
+)
+
+print(
+    "\nFiles exported successfully:"
+)
+
+print(
+    "1. model_performance.csv"
+)
+
+print(
+    "2. overfitting_analysis.csv"
+)
+
+print(
+    "3. train_only_vif.csv"
+)
+
+print(
+    "4. feature_importance.csv"
+)
+
+print(
+    "5. physician_adoption_predictions.csv"
+)
+
+# ============================================================
+# 53. FINAL LEAKAGE CHECKS
+# ============================================================
+
+assert TARGET_COL not in FEATURES
+
+assert (
+    "physician_gender"
+    not in FEATURES
+)
+
+assert (
+    ID_COL
+    not in FEATURES
+)
+
+assert (
+    set(X_train.columns)
+    == set(X_test.columns)
+)
+
+print(
+    "\n" + "=" * 80
+)
+
+print(
+    "FINAL LEAKAGE CHECKS PASSED"
+)
+
+print("=" * 80)
+
+print(
+    "Target/current prescription excluded:",
+    TARGET_COL not in FEATURES
+)
+
+print(
+    "Physician ID excluded:",
+    ID_COL not in FEATURES
+)
+
+print(
+    "Physician gender excluded:",
+    "physician_gender" not in FEATURES
+)
+
+print(
+    "Train/test features aligned:",
+    set(X_train.columns)
+    == set(X_test.columns)
+)
+
+print(
+    "SMOTE occurs inside CV pipeline only."
+)
+
+print(
+    "One-hot encoding is fitted inside each training fold."
+)
+
+print(
+    "Correlation/VIF calculated from TRAIN only."
+)
+
+print(
+    "Optuna uses TRAIN CV only."
+)
+
+print(
+    "Threshold selected from OOF TRAIN predictions only."
+)
+
+print(
+    "Final TEST remains untouched until evaluation."
+)
+
+print(
+    "\nPIPELINE COMPLETED."
+)
