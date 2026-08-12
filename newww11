@@ -1,0 +1,1336 @@
+# ============================================================
+# BASIC + ADVANCED EDA
+# FILE 1 = PHYSICIAN-QUARTER BEHAVIOR
+# FILE 2 = STATIC PHYSICIAN PROFILE
+# ============================================================
+
+import warnings
+warnings.filterwarnings("ignore")
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# ============================================================
+# 1. LOAD BOTH FILES
+# ============================================================
+
+FILE1 = "Input_data_file1.csv"
+FILE2 = "Input_data_file2.csv"
+
+df1 = pd.read_csv(FILE1)
+df2 = pd.read_csv(FILE2)
+
+print("=" * 80)
+print("INPUT FILE 1")
+print("=" * 80)
+print("Shape:", df1.shape)
+print("Unique physicians:", df1["physician_id"].nunique())
+print("Columns:")
+print(df1.columns.tolist())
+
+print("\n" + "=" * 80)
+print("INPUT FILE 2 - STATIC PHYSICIAN DATA")
+print("=" * 80)
+print("Shape:", df2.shape)
+print("Unique physicians:", df2["physician_id"].nunique())
+print("Columns:")
+print(df2.columns.tolist())
+
+# ============================================================
+# 2. FILE-LEVEL DATA QUALITY CHECK
+# ============================================================
+
+print("\n" + "=" * 80)
+print("FILE 1 BASIC CHECK")
+print("=" * 80)
+
+print("Rows:", len(df1))
+print("Columns:", df1.shape[1])
+print("Unique physicians:", df1["physician_id"].nunique())
+print("Duplicate rows:", df1.duplicated().sum())
+
+print("\nDuplicate physician-quarter combinations:")
+
+duplicate_pq = (
+    df1.groupby(
+        ["physician_id", "year_quarter"]
+    )
+    .size()
+    .reset_index(name="row_count")
+)
+
+print(
+    duplicate_pq[
+        duplicate_pq["row_count"] > 1
+    ].shape[0]
+)
+
+print("\n" + "=" * 80)
+print("FILE 2 BASIC CHECK")
+print("=" * 80)
+
+print("Rows:", len(df2))
+print("Columns:", df2.shape[1])
+print("Unique physicians:", df2["physician_id"].nunique())
+print(
+    "Duplicate physician IDs:",
+    df2["physician_id"].duplicated().sum()
+)
+
+# ============================================================
+# 3. CHECK WHETHER FILE 2 IS REALLY STATIC
+# ============================================================
+
+print("\n" + "=" * 80)
+print("STATIC PROFILE CHECK")
+print("=" * 80)
+
+profile_cols = [
+    c for c in df2.columns
+    if c != "physician_id"
+]
+
+for col in profile_cols:
+
+    unique_per_physician = (
+        df2.groupby("physician_id")[col]
+        .nunique(dropna=True)
+    )
+
+    changing_physicians = (
+        unique_per_physician > 1
+    ).sum()
+
+    print(
+        f"{col}: "
+        f"{changing_physicians} physicians have "
+        f"more than one value"
+    )
+
+# ============================================================
+# 4. MERGE FILE 1 + FILE 2
+# ============================================================
+
+before_merge = len(df1)
+
+df = df1.merge(
+    df2,
+    on="physician_id",
+    how="left",
+    validate="many_to_one",
+    suffixes=("", "_profile")
+)
+
+after_merge = len(df)
+
+print("\n" + "=" * 80)
+print("MERGED DATASET")
+print("=" * 80)
+
+print("Rows before merge:", before_merge)
+print("Rows after merge :", after_merge)
+print("Columns after merge:", df.shape[1])
+
+assert before_merge == after_merge, (
+    "ERROR: Row count changed after merge. "
+    "Check duplicate physician IDs in File 2."
+)
+
+print(
+    "Unique physicians after merge:",
+    df["physician_id"].nunique()
+)
+
+# ============================================================
+# 5. BASIC DATA UNDERSTANDING
+# ============================================================
+
+print("\n" + "=" * 80)
+print("OVERALL DATA UNDERSTANDING")
+print("=" * 80)
+
+print("Total observations:", len(df))
+print("Total columns:", df.shape[1])
+print(
+    "Unique physicians:",
+    df["physician_id"].nunique()
+)
+
+print(
+    "Observations per physician:"
+)
+
+print(
+    df.groupby("physician_id")
+    .size()
+    .describe()
+)
+
+# ============================================================
+# 6. QUARTER PREPARATION
+# ============================================================
+
+df["year_quarter"] = (
+    df["year_quarter"]
+    .astype(str)
+    .str.strip()
+)
+
+df["year"] = (
+    df["year_quarter"]
+    .str[:4]
+    .astype(int)
+)
+
+df["quarter"] = (
+    df["year_quarter"]
+    .str[-1]
+    .astype(int)
+)
+
+# Continuous quarter index
+df["quarter_index"] = (
+    df["year"] * 4
+    + df["quarter"]
+)
+
+df = (
+    df.sort_values(
+        ["physician_id", "quarter_index"]
+    )
+    .reset_index(drop=True)
+)
+
+print("\nAvailable quarters:")
+print(
+    df[
+        ["year_quarter", "quarter_index"]
+    ]
+    .drop_duplicates()
+    .sort_values("quarter_index")
+    .to_string(index=False)
+)
+
+# ============================================================
+# 7. MISSING VALUES - COUNT + PERCENTAGE
+# ============================================================
+
+missing_summary = pd.DataFrame({
+    "column": df.columns,
+    "missing_count": df.isna().sum().values,
+    "missing_percentage": (
+        df.isna().mean().values * 100
+    )
+})
+
+missing_summary = (
+    missing_summary
+    .sort_values(
+        "missing_percentage",
+        ascending=False
+    )
+    .reset_index(drop=True)
+)
+
+print("\n" + "=" * 80)
+print("MISSING VALUE ANALYSIS")
+print("=" * 80)
+
+print(
+    missing_summary.to_string(index=False)
+)
+
+# Missing-value plot
+missing_plot = (
+    missing_summary[
+        missing_summary["missing_percentage"] > 0
+    ]
+)
+
+if len(missing_plot) > 0:
+
+    plt.figure(
+        figsize=(
+            10,
+            max(5, len(missing_plot) * 0.35)
+        )
+    )
+
+    sns.barplot(
+        data=missing_plot,
+        x="missing_percentage",
+        y="column"
+    )
+
+    plt.title(
+        "Missing Values by Column (%)"
+    )
+    plt.xlabel("Missing Percentage")
+    plt.ylabel("Column")
+
+    plt.tight_layout()
+    plt.show()
+
+# ============================================================
+# 8. TARGET ANALYSIS
+# ============================================================
+
+TARGET = "brand_prescribed"
+
+# Ensure target is numeric if required
+if not pd.api.types.is_numeric_dtype(
+    df[TARGET]
+):
+    mapping = {
+        "yes": 1,
+        "y": 1,
+        "true": 1,
+        "1": 1,
+        "adopted": 1,
+        "prescribed": 1,
+        "no": 0,
+        "n": 0,
+        "false": 0,
+        "0": 0,
+        "not adopted": 0
+    }
+
+    df[TARGET] = (
+        df[TARGET]
+        .astype(str)
+        .str.lower()
+        .str.strip()
+        .map(mapping)
+    )
+
+print("\n" + "=" * 80)
+print("OVERALL ADOPTION")
+print("=" * 80)
+
+adopters = (df[TARGET] == 1).sum()
+non_adopters = (df[TARGET] == 0).sum()
+total_target = adopters + non_adopters
+
+print("Total records:", total_target)
+print("Adopter records:", adopters)
+print("Non-adopter records:", non_adopters)
+
+print(
+    "Adopter %:",
+    round(adopters / total_target * 100, 2)
+)
+
+print(
+    "Non-adopter %:",
+    round(non_adopters / total_target * 100, 2)
+)
+
+# ============================================================
+# 9. OVERALL ADOPTION PERCENTAGE GRAPH
+# ============================================================
+
+overall_target_pct = pd.DataFrame({
+    "Status": [
+        "Adopter",
+        "Non-Adopter"
+    ],
+    "Percentage": [
+        adopters / total_target * 100,
+        non_adopters / total_target * 100
+    ]
+})
+
+plt.figure(figsize=(7, 5))
+
+sns.barplot(
+    data=overall_target_pct,
+    x="Status",
+    y="Percentage"
+)
+
+plt.title(
+    "Overall Adopter vs Non-Adopter Distribution"
+)
+plt.ylabel("Percentage of Records")
+plt.xlabel("")
+
+for i, value in enumerate(
+    overall_target_pct["Percentage"]
+):
+    plt.text(
+        i,
+        value + 1,
+        f"{value:.1f}%",
+        ha="center"
+    )
+
+plt.ylim(0, 100)
+plt.tight_layout()
+plt.show()
+
+# ============================================================
+# 10. ADOPTERS VS NON-ADOPTERS BY QUARTER
+# ============================================================
+
+quarter_summary = (
+    df.groupby("year_quarter")
+    .agg(
+        total_records=(TARGET, "count"),
+        adopters=(TARGET, "sum"),
+        unique_physicians=(
+            "physician_id",
+            "nunique"
+        )
+    )
+    .reset_index()
+)
+
+quarter_summary["non_adopters"] = (
+    quarter_summary["total_records"]
+    - quarter_summary["adopters"]
+)
+
+quarter_summary["adoption_rate"] = (
+    quarter_summary["adopters"]
+    / quarter_summary["total_records"]
+    * 100
+)
+
+quarter_summary["non_adoption_rate"] = (
+    quarter_summary["non_adopters"]
+    / quarter_summary["total_records"]
+    * 100
+)
+
+quarter_summary = (
+    quarter_summary
+    .merge(
+        df[
+            ["year_quarter", "quarter_index"]
+        ].drop_duplicates(),
+        on="year_quarter",
+        how="left"
+    )
+    .sort_values("quarter_index")
+)
+
+print("\n" + "=" * 80)
+print("QUARTERLY ADOPTION SUMMARY")
+print("=" * 80)
+
+print(
+    quarter_summary[
+        [
+            "year_quarter",
+            "total_records",
+            "unique_physicians",
+            "adopters",
+            "non_adopters",
+            "adoption_rate",
+            "non_adoption_rate"
+        ]
+    ].to_string(index=False)
+)
+
+# ============================================================
+# 11. ADOPTION RATE TREND - MAIN GRAPH
+# ============================================================
+
+plt.figure(figsize=(12, 6))
+
+sns.lineplot(
+    data=quarter_summary,
+    x="year_quarter",
+    y="adoption_rate",
+    marker="o",
+    linewidth=2
+)
+
+plt.title(
+    "Physician Adoption Rate Trend Across Quarters"
+)
+
+plt.xlabel("Quarter")
+plt.ylabel("Adoption Rate (%)")
+plt.xticks(rotation=45)
+
+plt.ylim(0, 100)
+
+for _, row in quarter_summary.iterrows():
+
+    plt.text(
+        row["year_quarter"],
+        row["adoption_rate"] + 2,
+        f'{row["adoption_rate"]:.1f}%',
+        ha="center"
+    )
+
+plt.tight_layout()
+plt.show()
+
+# ============================================================
+# 12. ADOPTER VS NON-ADOPTER % BY QUARTER
+# ============================================================
+
+quarter_pct = quarter_summary[
+    [
+        "year_quarter",
+        "adoption_rate",
+        "non_adoption_rate"
+    ]
+].copy()
+
+quarter_pct = quarter_pct.melt(
+    id_vars="year_quarter",
+    var_name="status",
+    value_name="percentage"
+)
+
+quarter_pct["status"] = (
+    quarter_pct["status"]
+    .map({
+        "adoption_rate": "Adopter",
+        "non_adoption_rate": "Non-Adopter"
+    })
+)
+
+plt.figure(figsize=(13, 6))
+
+sns.lineplot(
+    data=quarter_pct,
+    x="year_quarter",
+    y="percentage",
+    hue="status",
+    marker="o",
+    linewidth=2
+)
+
+plt.title(
+    "Adopter vs Non-Adopter Percentage Trend"
+)
+
+plt.xlabel("Quarter")
+plt.ylabel("Percentage (%)")
+plt.xticks(rotation=45)
+plt.ylim(0, 100)
+
+plt.tight_layout()
+plt.show()
+
+# ============================================================
+# 13. QUARTER-TO-QUARTER CHANGE IN ADOPTION
+# ============================================================
+
+quarter_summary["adoption_rate_change_pp"] = (
+    quarter_summary["adoption_rate"]
+    .diff()
+)
+
+print("\n" + "=" * 80)
+print("QUARTER-TO-QUARTER ADOPTION CHANGE")
+print("=" * 80)
+
+print(
+    quarter_summary[
+        [
+            "year_quarter",
+            "adoption_rate",
+            "adoption_rate_change_pp"
+        ]
+    ].to_string(index=False)
+)
+
+# ============================================================
+# 14. PHYSICIAN COVERAGE BY QUARTER
+# ============================================================
+
+physician_quarter = (
+    df.groupby("year_quarter")
+    .agg(
+        unique_physicians=(
+            "physician_id",
+            "nunique"
+        ),
+        observations=(TARGET, "count")
+    )
+    .reset_index()
+)
+
+print("\n" + "=" * 80)
+print("PHYSICIAN COVERAGE BY QUARTER")
+print("=" * 80)
+
+print(
+    physician_quarter.to_string(index=False)
+)
+
+# ============================================================
+# 15. CHECK FOR PHYSICIAN QUARTER GAPS
+# ============================================================
+
+df["previous_quarter_index"] = (
+    df.groupby("physician_id")
+    ["quarter_index"]
+    .shift(1)
+)
+
+df["quarter_gap"] = (
+    df["quarter_index"]
+    - df["previous_quarter_index"]
+)
+
+df["has_gap"] = (
+    df["quarter_gap"] > 1
+)
+
+gap_summary = (
+    df.groupby("physician_id")
+    .agg(
+        quarters_observed=(
+            "quarter_index",
+            "nunique"
+        ),
+        number_of_gaps=(
+            "has_gap",
+            "sum"
+        ),
+        first_quarter=(
+            "quarter_index",
+            "min"
+        ),
+        last_quarter=(
+            "quarter_index",
+            "max"
+        )
+    )
+    .reset_index()
+)
+
+gap_summary["has_any_gap"] = (
+    gap_summary["number_of_gaps"] > 0
+)
+
+print("\n" + "=" * 80)
+print("PHYSICIAN QUARTER GAP ANALYSIS")
+print("=" * 80)
+
+print(
+    "Physicians with at least one quarter gap:",
+    gap_summary["has_any_gap"].sum()
+)
+
+print(
+    "Physicians with no quarter gaps:",
+    (~gap_summary["has_any_gap"]).sum()
+)
+
+print(
+    "Percentage with gaps:",
+    round(
+        gap_summary["has_any_gap"].mean() * 100,
+        2
+    ),
+    "%"
+)
+
+print("\nGap distribution:")
+print(
+    gap_summary["number_of_gaps"]
+    .value_counts()
+    .sort_index()
+)
+
+# Show physicians with gaps
+print("\nSample physicians with gaps:")
+
+print(
+    gap_summary[
+        gap_summary["has_any_gap"]
+    ]
+    .sort_values(
+        "number_of_gaps",
+        ascending=False
+    )
+    .head(20)
+    .to_string(index=False)
+)
+
+# ============================================================
+# 16. HOW MANY PHYSICIANS HAVE EACH NUMBER OF QUARTERS?
+# ============================================================
+
+physician_quarter_count = (
+    df.groupby("physician_id")
+    ["quarter_index"]
+    .nunique()
+)
+
+quarter_coverage = (
+    physician_quarter_count
+    .value_counts()
+    .sort_index()
+    .reset_index()
+)
+
+quarter_coverage.columns = [
+    "number_of_quarters",
+    "number_of_physicians"
+]
+
+quarter_coverage["percentage_physicians"] = (
+    quarter_coverage["number_of_physicians"]
+    / gap_summary.shape[0]
+    * 100
+)
+
+print("\n" + "=" * 80)
+print("PHYSICIAN QUARTER COVERAGE")
+print("=" * 80)
+
+print(
+    quarter_coverage.to_string(index=False)
+)
+
+# ============================================================
+# 17. UNIVARIATE ANALYSIS - NUMERIC VARIABLES
+# ============================================================
+
+numeric_cols = df.select_dtypes(
+    include=np.number
+).columns.tolist()
+
+# Remove technical/time columns from business analysis
+numeric_business_cols = [
+    c for c in numeric_cols
+    if c not in [
+        TARGET,
+        "year",
+        "quarter",
+        "quarter_index",
+        "previous_quarter_index",
+        "quarter_gap",
+        "has_gap"
+    ]
+]
+
+print("\n" + "=" * 80)
+print("NUMERIC VARIABLE SUMMARY")
+print("=" * 80)
+
+numeric_summary = (
+    df[numeric_business_cols]
+    .describe()
+    .T
+)
+
+numeric_summary["missing_count"] = (
+    df[numeric_business_cols]
+    .isna()
+    .sum()
+)
+
+numeric_summary["missing_percentage"] = (
+    df[numeric_business_cols]
+    .isna()
+    .mean()
+    .mul(100)
+)
+
+numeric_summary["unique_values"] = (
+    df[numeric_business_cols]
+    .nunique()
+)
+
+print(
+    numeric_summary.round(2)
+    .to_string()
+)
+
+# ============================================================
+# 18. NUMERIC UNIVARIATE DISTRIBUTIONS
+# ============================================================
+
+for col in numeric_business_cols:
+
+    fig, axes = plt.subplots(
+        1,
+        2,
+        figsize=(12, 4)
+    )
+
+    sns.histplot(
+        data=df,
+        x=col,
+        kde=True,
+        ax=axes[0]
+    )
+
+    axes[0].set_title(
+        f"Distribution: {col}"
+    )
+
+    sns.boxplot(
+        data=df,
+        x=col,
+        ax=axes[1]
+    )
+
+    axes[1].set_title(
+        f"Outlier Check: {col}"
+    )
+
+    plt.tight_layout()
+    plt.show()
+
+# ============================================================
+# 19. CATEGORICAL VARIABLE SUMMARY
+# ============================================================
+
+categorical_cols = df.select_dtypes(
+    include=["object", "category", "bool"]
+).columns.tolist()
+
+categorical_business_cols = [
+    c for c in categorical_cols
+    if c not in [
+        "physician_id",
+        "year_quarter"
+    ]
+]
+
+print("\n" + "=" * 80)
+print("CATEGORICAL VARIABLE ANALYSIS")
+print("=" * 80)
+
+for col in categorical_business_cols:
+
+    print("\n" + "-" * 70)
+    print("COLUMN:", col)
+    print("Unique values:", df[col].nunique())
+    print(
+        "Missing:",
+        df[col].isna().sum()
+    )
+    print(
+        "Missing %:",
+        round(df[col].isna().mean() * 100, 2)
+    )
+
+    print("\nValue distribution:")
+    print(
+        df[col]
+        .value_counts(
+            dropna=False,
+            normalize=True
+        )
+        .mul(100)
+        .round(2)
+        .head(20)
+    )
+
+# ============================================================
+# 20. CATEGORICAL UNIVARIATE PLOTS
+# ============================================================
+
+for col in categorical_business_cols:
+
+    # Avoid unreadable plots for extremely high-cardinality columns
+    if df[col].nunique(dropna=False) <= 20:
+
+        plt.figure(figsize=(10, 5))
+
+        temp = (
+            df[col]
+            .fillna("Missing")
+            .value_counts(normalize=True)
+            .mul(100)
+            .reset_index()
+        )
+
+        temp.columns = [
+            col,
+            "percentage"
+        ]
+
+        sns.barplot(
+            data=temp,
+            x=col,
+            y="percentage"
+        )
+
+        plt.title(
+            f"{col} - Percentage Distribution"
+        )
+
+        plt.ylabel("Percentage (%)")
+        plt.xlabel(col)
+        plt.xticks(rotation=45)
+
+        plt.tight_layout()
+        plt.show()
+
+# ============================================================
+# 21. BIVARIATE NUMERIC VS TARGET
+# ============================================================
+
+print("\n" + "=" * 80)
+print("NUMERIC VARIABLES VS ADOPTION")
+print("=" * 80)
+
+numeric_target_summary = []
+
+for col in numeric_business_cols:
+
+    temp = (
+        df.groupby(TARGET)[col]
+        .agg(
+            mean="mean",
+            median="median",
+            std="std"
+        )
+    )
+
+    print("\n", col)
+    print(temp.round(2))
+
+    # Difference in means
+    if 0 in temp.index and 1 in temp.index:
+
+        mean_difference = (
+            temp.loc[1, "mean"]
+            - temp.loc[0, "mean"]
+        )
+
+        numeric_target_summary.append({
+            "feature": col,
+            "non_adopter_mean": temp.loc[0, "mean"],
+            "adopter_mean": temp.loc[1, "mean"],
+            "difference": mean_difference
+        })
+
+numeric_target_summary = pd.DataFrame(
+    numeric_target_summary
+)
+
+print("\nMean difference summary:")
+print(
+    numeric_target_summary
+    .sort_values(
+        "difference",
+        key=abs,
+        ascending=False
+    )
+    .round(2)
+    .to_string(index=False)
+)
+
+# ============================================================
+# 22. NUMERIC VS TARGET BOXPLOTS
+# ============================================================
+
+for col in numeric_business_cols:
+
+    plt.figure(figsize=(7, 5))
+
+    sns.boxplot(
+        data=df,
+        x=TARGET,
+        y=col
+    )
+
+    plt.title(
+        f"{col}: Adopter vs Non-Adopter"
+    )
+
+    plt.xlabel(
+        "Brand Prescribed (0 = Non-Adopter, 1 = Adopter)"
+    )
+
+    plt.tight_layout()
+    plt.show()
+
+# ============================================================
+# 23. CATEGORICAL VS TARGET
+# ============================================================
+
+print("\n" + "=" * 80)
+print("CATEGORICAL VARIABLES VS ADOPTION")
+print("=" * 80)
+
+for col in categorical_business_cols:
+
+    if df[col].nunique(dropna=False) <= 30:
+
+        temp = (
+            df.assign(
+                category=df[col].fillna("Missing")
+            )
+            .groupby("category")[TARGET]
+            .agg(
+                observations="count",
+                adopters="sum",
+                adoption_rate="mean"
+            )
+            .reset_index()
+        )
+
+        temp["adoption_rate"] *= 100
+
+        print("\n" + "-" * 70)
+        print(col)
+        print("-" * 70)
+
+        print(
+            temp.sort_values(
+                "adoption_rate",
+                ascending=False
+            )
+            .round(2)
+            .to_string(index=False)
+        )
+
+        # Adoption rate graph, NOT raw count
+        plt.figure(figsize=(10, 5))
+
+        sns.barplot(
+            data=temp,
+            x="category",
+            y="adoption_rate"
+        )
+
+        plt.title(
+            f"Adoption Rate by {col}"
+        )
+
+        plt.xlabel(col)
+        plt.ylabel("Adoption Rate (%)")
+        plt.xticks(rotation=45)
+
+        plt.ylim(0, 100)
+
+        plt.tight_layout()
+        plt.show()
+
+# ============================================================
+# 24. CORRELATION ANALYSIS
+# ============================================================
+
+print("\n" + "=" * 80)
+print("CORRELATION ANALYSIS")
+print("=" * 80)
+
+corr_cols = (
+    numeric_business_cols
+    + [TARGET]
+)
+
+correlation = (
+    df[corr_cols]
+    .corr()
+)
+
+print(
+    correlation.round(3)
+)
+
+plt.figure(
+    figsize=(
+        max(10, len(corr_cols) * 0.55),
+        max(8, len(corr_cols) * 0.45)
+    )
+)
+
+sns.heatmap(
+    correlation,
+    annot=False,
+    center=0,
+    cmap="coolwarm"
+)
+
+plt.title(
+    "Correlation Matrix - Numeric Variables"
+)
+
+plt.tight_layout()
+plt.show()
+
+# ============================================================
+# 25. FEATURES MOST ASSOCIATED WITH TARGET
+# ============================================================
+
+target_corr = (
+    correlation[TARGET]
+    .drop(TARGET)
+    .sort_values(
+        key=abs,
+        ascending=False
+    )
+)
+
+print("\n" + "=" * 80)
+print("NUMERIC FEATURE - TARGET CORRELATION")
+print("=" * 80)
+
+print(
+    target_corr.round(3)
+)
+
+# ============================================================
+# 26. HIGH CORRELATION PAIRS
+# ============================================================
+
+feature_corr = (
+    df[numeric_business_cols]
+    .corr()
+)
+
+upper = feature_corr.where(
+    np.triu(
+        np.ones(feature_corr.shape),
+        k=1
+    ).astype(bool)
+)
+
+high_corr_pairs = (
+    upper.stack()
+    .reset_index()
+)
+
+high_corr_pairs.columns = [
+    "feature_1",
+    "feature_2",
+    "correlation"
+]
+
+high_corr_pairs["abs_correlation"] = (
+    high_corr_pairs["correlation"].abs()
+)
+
+high_corr_pairs = (
+    high_corr_pairs[
+        high_corr_pairs["abs_correlation"] >= 0.70
+    ]
+    .sort_values(
+        "abs_correlation",
+        ascending=False
+    )
+)
+
+print("\n" + "=" * 80)
+print("HIGHLY CORRELATED FEATURE PAIRS")
+print("=" * 80)
+
+print(
+    high_corr_pairs
+    .round(3)
+    .to_string(index=False)
+)
+
+# ============================================================
+# 27. PHYSICIAN ADOPTION TRANSITIONS
+# ============================================================
+# This is useful before building the lag model.
+# It tells us how often physicians move from
+# non-adopter -> adopter.
+
+df["previous_brand_prescribed"] = (
+    df.groupby("physician_id")
+    [TARGET]
+    .shift(1)
+)
+
+transition_data = df[
+    df["previous_brand_prescribed"].notna()
+].copy()
+
+transition_data["transition"] = (
+    transition_data[
+        "previous_brand_prescribed"
+    ].astype(int).astype(str)
+    + " -> "
+    + transition_data[TARGET]
+    .astype(int).astype(str)
+)
+
+transition_summary = (
+    transition_data["transition"]
+    .value_counts()
+    .reset_index()
+)
+
+transition_summary.columns = [
+    "transition",
+    "count"
+]
+
+transition_summary["percentage"] = (
+    transition_summary["count"]
+    / transition_summary["count"].sum()
+    * 100
+)
+
+print("\n" + "=" * 80)
+print("PHYSICIAN ADOPTION TRANSITIONS")
+print("=" * 80)
+
+print(
+    transition_summary
+    .round(2)
+    .to_string(index=False)
+)
+
+# ============================================================
+# 28. FIRST ADOPTION ANALYSIS
+# ============================================================
+# When does a physician first become an adopter?
+
+first_adoption = (
+    df[df[TARGET] == 1]
+    .groupby("physician_id")["quarter_index"]
+    .min()
+    .reset_index(name="first_adoption_quarter")
+)
+
+print("\n" + "=" * 80)
+print("FIRST ADOPTION ANALYSIS")
+print("=" * 80)
+
+print(
+    "Physicians who ever adopted:",
+    first_adoption["physician_id"].nunique()
+)
+
+first_adoption_distribution = (
+    first_adoption
+    .merge(
+        df[
+            [
+                "quarter_index",
+                "year_quarter"
+            ]
+        ].drop_duplicates(),
+        left_on="first_adoption_quarter",
+        right_on="quarter_index",
+        how="left"
+    )
+    .groupby("year_quarter")
+    .size()
+    .reset_index(
+        name="new_adopters"
+    )
+)
+
+print(
+    first_adoption_distribution
+    .to_string(index=False)
+)
+
+plt.figure(figsize=(12, 5))
+
+sns.lineplot(
+    data=first_adoption_distribution,
+    x="year_quarter",
+    y="new_adopters",
+    marker="o"
+)
+
+plt.title(
+    "New Physician Adoptions by Quarter"
+)
+
+plt.xlabel("Quarter")
+plt.ylabel("Number of New Adopters")
+plt.xticks(rotation=45)
+
+plt.tight_layout()
+plt.show()
+
+# ============================================================
+# 29. PHYSICIAN ACTIVITY CONSISTENCY
+# ============================================================
+
+activity_count = (
+    df.groupby("physician_id")
+    .size()
+    .reset_index(
+        name="observed_quarters"
+    )
+)
+
+print("\n" + "=" * 80)
+print("PHYSICIAN OBSERVATION DEPTH")
+print("=" * 80)
+
+print(
+    activity_count[
+        "observed_quarters"
+    ].describe()
+)
+
+plt.figure(figsize=(8, 5))
+
+sns.histplot(
+    data=activity_count,
+    x="observed_quarters",
+    discrete=True
+)
+
+plt.title(
+    "Number of Observed Quarters per Physician"
+)
+
+plt.xlabel("Number of Quarters")
+plt.ylabel("Number of Physicians")
+
+plt.tight_layout()
+plt.show()
+
+# ============================================================
+# 30. FINAL EDA SUMMARY
+# ============================================================
+
+print("\n" + "=" * 80)
+print("FINAL EDA SUMMARY")
+print("=" * 80)
+
+print("Merged observations:", len(df))
+print(
+    "Merged columns:",
+    df.shape[1]
+)
+print(
+    "Unique physicians:",
+    df["physician_id"].nunique()
+)
+print(
+    "Number of quarters:",
+    df["year_quarter"].nunique()
+)
+print(
+    "Adopters:",
+    adopters
+)
+print(
+    "Non-adopters:",
+    non_adopters
+)
+print(
+    "Overall adoption rate:",
+    round(
+        adopters / total_target * 100,
+        2
+    ),
+    "%"
+)
+print(
+    "Physicians with quarter gaps:",
+    gap_summary["has_any_gap"].sum()
+)
+print(
+    "Physicians without quarter gaps:",
+    (~gap_summary["has_any_gap"]).sum()
+)
+
+print("\nEDA COMPLETED SUCCESSFULLY.")
