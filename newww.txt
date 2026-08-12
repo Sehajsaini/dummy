@@ -1,0 +1,649 @@
+# ============================================================
+# BASIC EDA - PHYSICIAN ADOPTION DATA
+# ============================================================
+
+import warnings
+warnings.filterwarnings("ignore")
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# ------------------------------------------------------------
+# 1. LOAD DATA
+# ------------------------------------------------------------
+
+df = pd.read_csv("Input_data_file1.csv")
+
+print("Dataset loaded successfully.")
+print("=" * 70)
+
+# ------------------------------------------------------------
+# 2. BASIC DATASET INFORMATION
+# ------------------------------------------------------------
+
+print("\nDATASET SHAPE")
+print("-" * 50)
+print("Rows    :", df.shape[0])
+print("Columns :", df.shape[1])
+
+print("\nFIRST 5 ROWS")
+print("-" * 50)
+print(df.head())
+
+print("\nLAST 5 ROWS")
+print("-" * 50)
+print(df.tail())
+
+print("\nCOLUMN NAMES")
+print("-" * 50)
+print(df.columns.tolist())
+
+print("\nDATA TYPES")
+print("-" * 50)
+print(df.dtypes)
+
+print("\nDATAFRAME INFO")
+print("-" * 50)
+df.info()
+
+# ------------------------------------------------------------
+# 3. UNIQUE PHYSICIANS
+# ------------------------------------------------------------
+
+print("\nUNIQUE PHYSICIAN ANALYSIS")
+print("-" * 50)
+
+print("Number of unique physicians:",
+      df["physician_id"].nunique())
+
+print("Number of rows:",
+      len(df))
+
+print("Average rows per physician:",
+      round(len(df) / df["physician_id"].nunique(), 2))
+
+# Number of records per physician
+physician_records = (
+    df.groupby("physician_id")
+      .size()
+      .reset_index(name="number_of_records")
+)
+
+print("\nRecords per physician:")
+print(physician_records["number_of_records"].describe())
+
+# ------------------------------------------------------------
+# 4. DUPLICATE ANALYSIS
+# ------------------------------------------------------------
+
+print("\nDUPLICATE ANALYSIS")
+print("-" * 50)
+
+print("Complete duplicate rows:",
+      df.duplicated().sum())
+
+# If physician_id + quarter uniquely identifies a row
+if "quarter" in df.columns:
+    print(
+        "Duplicate physician-quarter combinations:",
+        df.duplicated(
+            subset=["physician_id", "quarter"]
+        ).sum()
+    )
+
+# ------------------------------------------------------------
+# 5. MISSING VALUE ANALYSIS
+# ------------------------------------------------------------
+
+print("\nMISSING VALUE ANALYSIS")
+print("-" * 50)
+
+missing_summary = pd.DataFrame({
+    "column": df.columns,
+    "missing_count": df.isnull().sum().values,
+    "missing_percentage": (
+        df.isnull().mean().values * 100
+    ).round(2),
+    "data_type": df.dtypes.astype(str).values
+})
+
+missing_summary = missing_summary.sort_values(
+    "missing_count",
+    ascending=False
+)
+
+print(missing_summary.to_string(index=False))
+
+# Only columns having missing values
+print("\nCOLUMNS WITH MISSING VALUES")
+print("-" * 50)
+
+print(
+    missing_summary[
+        missing_summary["missing_count"] > 0
+    ].to_string(index=False)
+)
+
+# ------------------------------------------------------------
+# 6. TARGET VARIABLE ANALYSIS
+# ------------------------------------------------------------
+
+TARGET = "brand_prescribed"
+
+print("\nTARGET VARIABLE")
+print("-" * 50)
+
+print("Target column:", TARGET)
+print("Number of unique target values:",
+      df[TARGET].nunique())
+
+print("\nTarget values:")
+print(df[TARGET].value_counts(dropna=False))
+
+# ------------------------------------------------------------
+# 7. ADOPTERS VS NON-ADOPTERS
+# ------------------------------------------------------------
+
+print("\nADOPTERS VS NON-ADOPTERS")
+print("-" * 50)
+
+target_counts = df[TARGET].value_counts()
+
+target_percentage = (
+    df[TARGET]
+    .value_counts(normalize=True)
+    .mul(100)
+    .round(2)
+)
+
+target_summary = pd.DataFrame({
+    "count": target_counts,
+    "percentage": target_percentage
+})
+
+print(target_summary)
+
+# ------------------------------------------------------------
+# 8. ADOPTERS VS NON-ADOPTERS BY QUARTER
+# ------------------------------------------------------------
+
+if "quarter" in df.columns:
+
+    print("\nADOPTERS VS NON-ADOPTERS BY QUARTER")
+    print("-" * 50)
+
+    quarter_target = pd.crosstab(
+        df["quarter"],
+        df[TARGET]
+    )
+
+    print(quarter_target)
+
+    # Percentages within each quarter
+    quarter_target_pct = pd.crosstab(
+        df["quarter"],
+        df[TARGET],
+        normalize="index"
+    ).mul(100).round(2)
+
+    print("\nPERCENTAGE OF ADOPTERS/NON-ADOPTERS WITHIN EACH QUARTER")
+    print("-" * 50)
+
+    print(quarter_target_pct)
+
+    # --------------------------------------------------------
+    # 9. ADOPTION RATE BY QUARTER
+    # --------------------------------------------------------
+
+    quarter_adoption = (
+        df.groupby("quarter")[TARGET]
+          .agg(
+              total_physician_records="count",
+              adopters="sum",
+              adoption_rate="mean"
+          )
+          .reset_index()
+    )
+
+    quarter_adoption["non_adopters"] = (
+        quarter_adoption["total_physician_records"]
+        - quarter_adoption["adopters"]
+    )
+
+    quarter_adoption["adoption_rate"] = (
+        quarter_adoption["adoption_rate"] * 100
+    ).round(2)
+
+    print("\nQUARTERLY ADOPTION SUMMARY")
+    print("-" * 50)
+
+    print(quarter_adoption)
+
+# ------------------------------------------------------------
+# 10. NUMBER OF UNIQUE PHYSICIANS BY QUARTER
+# ------------------------------------------------------------
+
+if "quarter" in df.columns:
+
+    physician_quarter = (
+        df.groupby("quarter")["physician_id"]
+          .nunique()
+          .reset_index(
+              name="unique_physicians"
+          )
+    )
+
+    print("\nUNIQUE PHYSICIANS BY QUARTER")
+    print("-" * 50)
+
+    print(physician_quarter)
+
+# ------------------------------------------------------------
+# 11. PHYSICIAN COVERAGE ACROSS QUARTERS
+# ------------------------------------------------------------
+
+if "quarter" in df.columns:
+
+    physician_quarter_count = (
+        df.groupby("physician_id")["quarter"]
+          .nunique()
+    )
+
+    print("\nNUMBER OF QUARTERS PER PHYSICIAN")
+    print("-" * 50)
+
+    print(
+        physician_quarter_count.describe()
+    )
+
+    print("\nDistribution of number of quarters per physician:")
+    print(
+        physician_quarter_count.value_counts()
+        .sort_index()
+    )
+
+# ------------------------------------------------------------
+# 12. UNIVARIATE ANALYSIS - NUMERIC VARIABLES
+# ------------------------------------------------------------
+
+numeric_cols = df.select_dtypes(
+    include=np.number
+).columns.tolist()
+
+print("\nNUMERIC COLUMNS")
+print("-" * 50)
+print(numeric_cols)
+
+if numeric_cols:
+
+    numeric_summary = df[numeric_cols].describe().T
+
+    numeric_summary["missing"] = (
+        df[numeric_cols].isnull().sum()
+    )
+
+    numeric_summary["unique_values"] = (
+        df[numeric_cols].nunique()
+    )
+
+    print("\nNUMERIC SUMMARY")
+    print("-" * 50)
+
+    print(numeric_summary)
+
+# ------------------------------------------------------------
+# 13. UNIVARIATE ANALYSIS - CATEGORICAL VARIABLES
+# ------------------------------------------------------------
+
+categorical_cols = df.select_dtypes(
+    include=["object", "category", "bool"]
+).columns.tolist()
+
+print("\nCATEGORICAL COLUMNS")
+print("-" * 50)
+print(categorical_cols)
+
+for col in categorical_cols:
+
+    print("\n" + "=" * 60)
+    print("COLUMN:", col)
+    print("=" * 60)
+
+    print("Unique values:", df[col].nunique())
+    print("Missing:", df[col].isnull().sum())
+
+    print("\nValue counts:")
+    print(
+        df[col]
+        .value_counts(dropna=False)
+        .head(20)
+    )
+
+# ------------------------------------------------------------
+# 14. BIVARIATE - NUMERIC VARIABLES VS TARGET
+# ------------------------------------------------------------
+
+print("\nNUMERIC VARIABLES VS TARGET")
+print("-" * 50)
+
+numeric_vs_target = []
+
+for col in numeric_cols:
+
+    if col == TARGET:
+        continue
+
+    grouped = (
+        df.groupby(TARGET)[col]
+          .agg(["count", "mean", "median", "std"])
+    )
+
+    print("\n", "=" * 60)
+    print(col)
+    print("=" * 60)
+    print(grouped)
+
+# ------------------------------------------------------------
+# 15. BIVARIATE - CATEGORICAL VARIABLES VS TARGET
+# ------------------------------------------------------------
+
+print("\nCATEGORICAL VARIABLES VS TARGET")
+print("-" * 50)
+
+for col in categorical_cols:
+
+    if col == TARGET:
+        continue
+
+    print("\n" + "=" * 60)
+    print(col)
+    print("=" * 60)
+
+    # Count
+    print("\nCounts:")
+    print(
+        pd.crosstab(
+            df[col],
+            df[TARGET]
+        )
+    )
+
+    # Percentage
+    print("\nTarget percentage within category:")
+    print(
+        pd.crosstab(
+            df[col],
+            df[TARGET],
+            normalize="index"
+        ).mul(100).round(2)
+    )
+
+# ------------------------------------------------------------
+# 16. CORRELATION ANALYSIS
+# ------------------------------------------------------------
+
+if len(numeric_cols) > 1:
+
+    print("\nCORRELATION MATRIX")
+    print("-" * 50)
+
+    correlation = df[numeric_cols].corr()
+
+    print(correlation.round(3))
+
+# ------------------------------------------------------------
+# 17. HIGH CORRELATION PAIRS
+# ------------------------------------------------------------
+
+if len(numeric_cols) > 1:
+
+    correlation = df[numeric_cols].corr()
+
+    upper = correlation.where(
+        np.triu(
+            np.ones(correlation.shape),
+            k=1
+        ).astype(bool)
+    )
+
+    high_corr = (
+        upper.stack()
+        .reset_index()
+    )
+
+    high_corr.columns = [
+        "feature_1",
+        "feature_2",
+        "correlation"
+    ]
+
+    high_corr["abs_correlation"] = (
+        high_corr["correlation"].abs()
+    )
+
+    high_corr = high_corr[
+        high_corr["abs_correlation"] >= 0.70
+    ].sort_values(
+        "abs_correlation",
+        ascending=False
+    )
+
+    print("\nHIGHLY CORRELATED NUMERIC FEATURES")
+    print("-" * 50)
+
+    print(high_corr)
+
+# ============================================================
+# VISUAL EDA
+# ============================================================
+
+# ------------------------------------------------------------
+# 18. TARGET DISTRIBUTION
+# ------------------------------------------------------------
+
+plt.figure(figsize=(7, 5))
+
+sns.countplot(
+    data=df,
+    x=TARGET
+)
+
+plt.title("Adopters vs Non-Adopters")
+plt.xlabel("Brand Prescribed")
+plt.ylabel("Number of Records")
+plt.tight_layout()
+plt.show()
+
+# ------------------------------------------------------------
+# 19. ADOPTION BY QUARTER
+# ------------------------------------------------------------
+
+if "quarter" in df.columns:
+
+    plt.figure(figsize=(10, 6))
+
+    sns.countplot(
+        data=df,
+        x="quarter",
+        hue=TARGET
+    )
+
+    plt.title(
+        "Adopters vs Non-Adopters Across Quarters"
+    )
+
+    plt.xlabel("Quarter")
+    plt.ylabel("Number of Physician Records")
+    plt.xticks(rotation=45)
+
+    plt.tight_layout()
+    plt.show()
+
+# ------------------------------------------------------------
+# 20. ADOPTION RATE TREND
+# ------------------------------------------------------------
+
+if "quarter" in df.columns:
+
+    plt.figure(figsize=(10, 5))
+
+    sns.lineplot(
+        data=quarter_adoption,
+        x="quarter",
+        y="adoption_rate",
+        marker="o"
+    )
+
+    plt.title("Adoption Rate Across Quarters")
+    plt.xlabel("Quarter")
+    plt.ylabel("Adoption Rate (%)")
+    plt.xticks(rotation=45)
+
+    plt.tight_layout()
+    plt.show()
+
+# ------------------------------------------------------------
+# 21. NUMERIC DISTRIBUTIONS
+# ------------------------------------------------------------
+
+for col in numeric_cols:
+
+    if col == TARGET:
+        continue
+
+    plt.figure(figsize=(7, 5))
+
+    sns.histplot(
+        data=df,
+        x=col,
+        kde=True
+    )
+
+    plt.title(f"Distribution of {col}")
+    plt.tight_layout()
+    plt.show()
+
+# ------------------------------------------------------------
+# 22. NUMERIC VARIABLES BY TARGET
+# ------------------------------------------------------------
+
+for col in numeric_cols:
+
+    if col == TARGET:
+        continue
+
+    plt.figure(figsize=(7, 5))
+
+    sns.boxplot(
+        data=df,
+        x=TARGET,
+        y=col
+    )
+
+    plt.title(
+        f"{col}: Adopters vs Non-Adopters"
+    )
+
+    plt.tight_layout()
+    plt.show()
+
+# ------------------------------------------------------------
+# 23. CORRELATION HEATMAP
+# ------------------------------------------------------------
+
+if len(numeric_cols) > 1:
+
+    plt.figure(
+        figsize=(
+            max(10, len(numeric_cols) * 0.6),
+            max(8, len(numeric_cols) * 0.5)
+        )
+    )
+
+    sns.heatmap(
+        df[numeric_cols].corr(),
+        cmap="coolwarm",
+        center=0,
+        annot=False
+    )
+
+    plt.title("Correlation Heatmap")
+    plt.tight_layout()
+    plt.show()
+
+# ------------------------------------------------------------
+# 24. CATEGORICAL VS TARGET PLOTS
+# ------------------------------------------------------------
+
+for col in categorical_cols:
+
+    if col == TARGET:
+        continue
+
+    # Avoid extremely high-cardinality columns
+    if df[col].nunique(dropna=False) <= 15:
+
+        plt.figure(figsize=(9, 5))
+
+        sns.countplot(
+            data=df,
+            x=col,
+            hue=TARGET
+        )
+
+        plt.title(
+            f"{col}: Adopters vs Non-Adopters"
+        )
+
+        plt.xticks(rotation=45)
+        plt.tight_layout()
+        plt.show()
+
+# ------------------------------------------------------------
+# 25. FINAL DATA QUALITY SUMMARY
+# ------------------------------------------------------------
+
+print("\n" + "=" * 70)
+print("FINAL BASIC EDA SUMMARY")
+print("=" * 70)
+
+print("Total rows:", len(df))
+print("Total columns:", df.shape[1])
+print(
+    "Unique physicians:",
+    df["physician_id"].nunique()
+)
+print(
+    "Duplicate rows:",
+    df.duplicated().sum()
+)
+print(
+    "Total missing values:",
+    df.isnull().sum().sum()
+)
+
+if "quarter" in df.columns:
+    print(
+        "Number of quarters:",
+        df["quarter"].nunique()
+    )
+
+print(
+    "Adopters:",
+    (df[TARGET] == 1).sum()
+)
+
+print(
+    "Non-adopters:",
+    (df[TARGET] == 0).sum()
+)
+
+print(
+    "Overall adoption rate:",
+    round(df[TARGET].mean() * 100, 2),
+    "%"
+)
+
+print("\nEDA COMPLETED.")
