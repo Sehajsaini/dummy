@@ -1,0 +1,186 @@
+import pandas as pd
+import matplotlib.pyplot as plt
+
+# ============================================================
+# FIRST-TIME ADOPTERS AND NEVER ADOPTERS: Q1-Q10
+# ============================================================
+# First-time adopter = physician's first adoption occurs in
+# that quarter. The physician is counted only once.
+# Never adopter = physician never adopts in Q1-Q10.
+#
+# Expected columns:
+# physician_id, quarter, adopter
+# ============================================================
+
+# 1. LOAD DATA
+df = pd.read_csv("input_data_file1.csv")
+
+# 2. CHECK REQUIRED COLUMNS
+required_columns = ["physician_id", "quarter", "adopter"]
+missing_columns = [c for c in required_columns if c not in df.columns]
+
+if missing_columns:
+    raise ValueError(f"Missing required columns: {missing_columns}")
+
+# 3. CLEAN DATA
+df = df.copy()
+df["quarter"] = pd.to_numeric(df["quarter"], errors="coerce")
+df["adopter"] = pd.to_numeric(df["adopter"], errors="coerce")
+
+# Keep Q1-Q10 only
+df = df[df["quarter"].between(1, 10)].copy()
+
+# Treat missing adopter as non-adopter
+df["adopter"] = df["adopter"].fillna(0)
+df["adopter"] = (df["adopter"] > 0).astype(int)
+
+# Remove rows without physician or quarter
+df = df.dropna(subset=["physician_id", "quarter"])
+df["quarter"] = df["quarter"].astype(int)
+
+df = df.sort_values(["physician_id", "quarter"]).reset_index(drop=True)
+
+# 4. TOTAL UNIQUE PHYSICIANS
+total_physicians = df["physician_id"].nunique()
+
+print("=" * 60)
+print("OVERALL PHYSICIAN ADOPTION ANALYSIS")
+print("=" * 60)
+print(f"Total unique physicians in Q1-Q10: {total_physicians:,}")
+
+# 5. FIRST ADOPTION QUARTER FOR EACH PHYSICIAN
+first_adoption = (
+    df.loc[df["adopter"] == 1]
+    .groupby("physician_id")["quarter"]
+    .min()
+    .reset_index()
+    .rename(columns={"quarter": "first_adoption_quarter"})
+)
+
+# 6. FIRST-TIME ADOPTERS BY QUARTER
+first_time_by_quarter = (
+    first_adoption
+    .groupby("first_adoption_quarter")["physician_id"]
+    .nunique()
+    .reindex(range(1, 11), fill_value=0)
+)
+
+first_time_summary = pd.DataFrame({
+    "Quarter": range(1, 11),
+    "First_Time_Adopters": first_time_by_quarter.values
+})
+
+first_time_summary["Percentage_of_All_Physicians"] = (
+    first_time_summary["First_Time_Adopters"]
+    / total_physicians * 100
+)
+
+# 7. NEVER ADOPTERS
+all_physicians = set(df["physician_id"].unique())
+ever_adopted = set(first_adoption["physician_id"].unique())
+never_adopted = all_physicians - ever_adopted
+
+never_adopter_count = len(never_adopted)
+
+# 8. TOTAL FIRST-TIME ADOPTERS
+first_time_adopter_count = first_adoption["physician_id"].nunique()
+
+first_time_percentage = first_time_adopter_count / total_physicians * 100
+never_adopter_percentage = never_adopter_count / total_physicians * 100
+
+# 9. PRINT OVERALL RESULTS
+print("\nOVERALL SUMMARY")
+print("-" * 60)
+print(f"Total Physicians    : {total_physicians:,}")
+print(
+    f"First-Time Adopters : {first_time_adopter_count:,} "
+    f"({first_time_percentage:.2f}%)"
+)
+print(
+    f"Never Adopters      : {never_adopter_count:,} "
+    f"({never_adopter_percentage:.2f}%)"
+)
+
+# 10. FIRST-TIME ADOPTION BY QUARTER
+print("\nFIRST-TIME ADOPTERS BY QUARTER")
+print("-" * 60)
+print(first_time_summary.to_string(index=False))
+
+# 11. CHECK GROUPS
+print("\nCHECK")
+print("-" * 60)
+print(
+    "First-time adopters + never adopters = "
+    f"{first_time_adopter_count + never_adopter_count:,}"
+)
+print(f"Total physicians = {total_physicians:,}")
+
+if first_time_adopter_count + never_adopter_count == total_physicians:
+    print("Check passed: every physician belongs to exactly one group.")
+else:
+    print("Check failed: investigate the data.")
+
+# 12. GRAPH: NUMBER OF FIRST-TIME ADOPTERS BY QUARTER
+plt.figure(figsize=(10, 5))
+plt.plot(
+    first_time_summary["Quarter"],
+    first_time_summary["First_Time_Adopters"],
+    marker="o"
+)
+plt.xlabel("Quarter")
+plt.ylabel("Number of First-Time Adopters")
+plt.title("First-Time Physician Adoption by Quarter")
+plt.xticks(range(1, 11))
+plt.grid(True, alpha=0.3)
+plt.tight_layout()
+plt.show()
+
+# 13. GRAPH: FIRST-TIME ADOPTION PERCENTAGE BY QUARTER
+plt.figure(figsize=(10, 5))
+plt.plot(
+    first_time_summary["Quarter"],
+    first_time_summary["Percentage_of_All_Physicians"],
+    marker="o"
+)
+plt.xlabel("Quarter")
+plt.ylabel("First-Time Adopters (% of All Physicians)")
+plt.title("First-Time Adoption Rate by Quarter")
+plt.xticks(range(1, 11))
+plt.grid(True, alpha=0.3)
+plt.tight_layout()
+plt.show()
+
+# 14. OVERALL FIRST-TIME VS NEVER ADOPTER SUMMARY
+comparison = pd.DataFrame({
+    "Category": ["First-Time Adopters", "Never Adopters"],
+    "Count": [first_time_adopter_count, never_adopter_count],
+    "Percentage": [first_time_percentage, never_adopter_percentage]
+})
+
+print("\nFIRST-TIME VS NEVER ADOPTERS")
+print("-" * 60)
+print(comparison.to_string(index=False))
+
+# 15. GRAPH: FIRST-TIME VS NEVER ADOPTER %
+plt.figure(figsize=(8, 5))
+plt.bar(comparison["Category"], comparison["Percentage"])
+plt.ylabel("Percentage of Physicians (%)")
+plt.title("First-Time Adopters vs Never Adopters")
+plt.xticks(rotation=15)
+plt.tight_layout()
+plt.show()
+
+# 16. SAVE RESULTS
+first_time_summary.to_csv(
+    "first_time_adopters_by_quarter.csv",
+    index=False
+)
+
+comparison.to_csv(
+    "first_time_vs_never_adopters.csv",
+    index=False
+)
+
+print("\nResult files saved:")
+print("1. first_time_adopters_by_quarter.csv")
+print("2. first_time_vs_never_adopters.csv")
