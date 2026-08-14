@@ -1,0 +1,1018 @@
+"""
+=========================================================================================
+ ML 102 - DRUG ADOPTION CAPSTONE  |  END-TO-END PRODUCTION PIPELINE  (FIXED v4)
+=========================================================================================
+Objective : Predict which of the 1,502 non-adopted physicians (Test_physicians.csv) will
+            adopt drug 'XYZ' in Quarter 11, using 10 quarters of historical transactional
+            data (Input_data_file1.csv) and static physician profile data
+            (Input_data_file2.csv).
+
+WHAT CHANGED IN v4 (per your latest instructions) - read this first
+-------------------------------------------------------------------------------------------
+1. NO SMOTE anywhere. Class imbalance is handled purely via scale_pos_weight (tuned by
+   Optuna), which does not fabricate synthetic rows the way SMOTE does.
+
+2. VIF-based feature removal is now RESTRICTED to only physician_gender_* and
+   physician_value_tier_* columns. lag1 / lag2 / lag_avg / lag_change columns are NEVER
+   removed for having high VIF - they are always kept and handed to the model, exactly
+   as you asked ("let model consume them"). Multicollinearity among lag features is not
+   a real problem for tree-based models (XGBoost/LightGBM split on one feature at a
+   time and are not sensitive to it the way linear/logistic regression is) - the
+   VIF check here exists only to clean up genuinely redundant demographic dummies.
+
+3. Feature pruning is now SHAP-driven instead of VIF-driven for everything except
+   gender/tier. The pipeline trains an initial ("Stage 1") model on the full feature
+   set, computes SHAP importance from BOTH XGBoost and LightGBM, and only drops a
+   feature if it is unimportant in BOTH models (below SHAP_IMPORTANCE_MIN_PCT of total
+   importance). A "Stage 2" model is then retrained on the reduced, cleaner feature set.
+
+4. physician_id and year_quarter (target_quarter) are NEVER dropped from the dataframe.
+   They are excluded only from the FEATURE LIST used to fit the model (which is the
+   correct approach - a raw ID or literal quarter label is not something you want a
+   tree model splitting on), while remaining present as columns throughout, used for
+   grouping, joins, and the time-based train/test split below. Nothing calls
+   .drop(columns=[ID_COL]) or .drop(columns=['target_quarter']) anywhere in this script.
+
+5. TIME-BASED SPLIT (replaces the old random 80/20 split):
+     - TRAIN : target quarters 3-8   (quarter 1-2 excluded: too little lag history to be
+               fully reliable, per your instruction to start at quarter 3)
+     - TEST  : target quarters 9-10  (strictly after train, so test performance reflects
+               genuine forward-looking / out-of-time generalization)
+     - SCORE : quarter 10 used as the most recent lag -> predicts quarter 11 adoption
+               for the 1,502 physicians in Test_physicians.csv
+   This is a much more honest evaluation than a random split, because it matches how
+   the model will actually be used (train on the past, predict a future you haven't
+   seen yet).
+
+6. CROSS-VALIDATION METHOD COMPARISON (rolling window vs. StratifiedKFold vs. plain
+   KFold): implemented and run explicitly - see compare_cv_strategies(). Rolling-window
+   (expanding, time-ordered) CV is used for the real hyperparameter tuning, and here is
+   why, made concrete instead of asserted: StratifiedKFold and KFold both shuffle rows
+   from quarters 3-8 together at random, so a fold's "validation" data can include
+   quarter-3 rows while quarter-8 rows sit in the training fold - i.e. the model gets
+   to train on data that is chronologically AFTER some of what it's being validated on.
+   That never happens in real deployment (you only ever have the past to predict the
+   future), so hyperparameters chosen that way tend to look better in CV than they
+   actually perform on true out-of-time data (exactly the quarter 9-10 test set, and
+   quarter 11 scoring). Rolling-window CV only ever validates on a quarter that is
+   strictly after everything in its training fold, so it is the one CV scheme that is
+   methodologically consistent with the outer train(3-8)/test(9-10)/score(11) design.
+   The comparison prints actual PR-AUC numbers for all three so this isn't just a
+   claim - you can see the gap yourself.
+
+7. THRESHOLD - three things are now printed / produced instead of one silent 0.5 cutoff:
+     a. OOF-tuned threshold (F-beta optimized on out-of-fold rolling-CV predictions,
+        recent-folds-weighted) - the statistically-grounded choice.
+     b. A full threshold-scan table on the OOF data (precision/recall/F1/count at every
+        cutoff from 0.05 to 0.95).
+     c. A threshold-scan table on the ACTUAL Q11 SCORING POPULATION - since there are no
+        true labels for Q11 yet, this table only shows predicted count at each cutoff
+        (no precision/recall possible), but it directly answers "what threshold gives me
+        250-300 physicians" - you can read it straight off the table.
+     d. A "volume-calibrated" threshold is also computed automatically: the exact
+        probability cutoff that selects ~275 physicians (midpoint of your 250-300 target)
+        from the scoring population, output as its own column alongside the statistically
+        tuned prediction, so you have both a principled model-driven answer AND a
+        guaranteed-volume business answer in the same file.
+
+8. "Only use a physician's data up to their first adoption quarter" - unchanged from
+   v2/v3, verified correct via assert_single_adoption_per_physician(), which hard-fails
+   the run if any physician has more than one adoption row in the panel.
+
+DESIGN ASSUMPTIONS (unchanged, still valid):
+  A1. A physician is only a valid "non-adopted" training example for target quarter Q if
+      brand_prescribed == 0 for every quarter strictly before Q. Once a physician
+      adopts, all subsequent quarters are dropped from the panel.
+  A2. lag1 = most recent quarter strictly before target quarter; lag2 = second most
+      recent. Built via groupby(physician_id).shift() -> the target quarter's own
+      values are NEVER used as features -> zero leakage.
+  A3. Rows where lag1 is completely unavailable (physician's very first observed
+      quarter) are dropped. Rows where only lag2 is unavailable are kept; lag_avg /
+      lag_change are left NaN for those rows.
+  A4. For scoring Test_physicians.csv (Q11 prediction), lag1 = Quarter 10, lag2 =
+      Quarter 9 for every test physician.
+  A5. All EDA decisions (missingness threshold, gender mode, VIF) are learned on TRAIN
+      ONLY (quarters 3-8) and simply applied to test (9-10) / the Q11 scoring set.
+
+Run order: organized as sequential STEP blocks. Edit FILE PATHS and CONFIG in STEP 0,
+run top to bottom.
+=========================================================================================
+"""
+
+# =========================================================================================
+# STEP 0 : IMPORTS & CONFIG
+# =========================================================================================
+import warnings
+warnings.filterwarnings("ignore")
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+from sklearn.model_selection import StratifiedKFold, KFold
+from sklearn.preprocessing import OneHotEncoder
+from sklearn.metrics import (
+    accuracy_score, precision_score, recall_score, f1_score, fbeta_score,
+    roc_auc_score, roc_curve, precision_recall_curve, average_precision_score,
+    confusion_matrix, mean_absolute_error, classification_report
+)
+from statsmodels.stats.outliers_influence import variance_inflation_factor
+
+import xgboost as xgb
+import lightgbm as lgb
+import optuna
+optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+import shap
+
+RANDOM_STATE = 42
+np.random.seed(RANDOM_STATE)
+
+# ---- FILE PATHS (edit these) ----
+FILE1_PATH = "Input_data_file1.csv"       # transactional / time series
+FILE2_PATH = "Input_data_file2.csv"       # static physician profile
+TEST_PHYS_PATH = "Test_physicians.csv"    # list of non-adopted physicians to score
+
+OUTPUT_SCORED_PATH = "Test_physicians_scored_Q11.csv"
+
+# ---- COLUMN GROUPS (per spec) ----
+ID_COL = "physician_id"
+TIME_COL = "year_quarter"
+TARGET_COL = "brand_prescribed"
+
+# These columns stay in every dataframe throughout the script (never dropped). They are
+# only ever EXCLUDED from the feature list handed to the model - see feature_cols_all.
+NON_FEATURE_COLS = [ID_COL, "target_quarter", TARGET_COL]
+
+LAG_AVG_CHANGE_COLS = [
+    "total_representative_visits",
+    "total_sample_dropped",
+    "total_prescriptions_for_indication1",
+    "total_prescriptions_for_indication2",
+    "total_prescriptions_for_indication3",
+    "total_patient_with_commercial_insurance_plan",
+    "total_patient_with_medicare_insurance_plan",
+    "total_patient_with_medicaid_insurance_plan",
+    "brand_web_impressions",
+    "brand_ehr_impressions",
+    "brand_enews_impressions",
+    "brand_mobile_impressions",
+    "total_competitor_prescription",
+    "new_prescriptions",
+]
+
+LAG_CHANGE_ONLY_COLS = [
+    "saving_cards_dropped",
+    "vouchers_dropped",
+    "total_seminar_as_attendee",
+    "total_seminar_as_speaker",
+]
+
+MOST_RECENT_ONLY_COLS = [
+    "physician_hospital_affiliation",
+    "physician_in_group_practice",
+]
+
+TIER_COL = "physician_value_tier"
+CATEGORICAL_COLS = ["physician_gender", "physician_speciality"]
+
+# ---- TIME-BASED SPLIT CONFIG ----
+TRAIN_QUARTER_RANGE = (3, 8)     # inclusive, ordinal (1..N)
+TEST_QUARTER_RANGE = (9, 10)     # inclusive, ordinal (1..N)
+ROLLING_MIN_TRAIN_QUARTERS = 2   # inner-CV warm-up window size within quarters 3-8
+
+# ---- IMBALANCE / THRESHOLD CONFIG ----
+FBETA_BETA = 1.5                 # >1 weights recall higher than precision
+FINAL_THRESHOLD_OVERRIDE = None  # set a float to bypass auto-tuning, else None
+THRESHOLD_RECENT_N_FOLDS = 3     # tune final threshold on the most recent N CV folds
+TOPN_BUSINESS_FLAG = 300         # guaranteed-size candidate list, independent of threshold
+VOLUME_TARGET_N = 275            # midpoint of your requested 250-300 physician range
+
+# ---- VIF / SHAP FEATURE-SELECTION CONFIG ----
+VIF_THRESHOLD = 10.0             # applied ONLY to gender/tier columns (see #2 above)
+SHAP_IMPORTANCE_MIN_PCT = 0.10   # % of total SHAP importance below which a feature is
+                                  # dropped, but ONLY if it's below this in BOTH models
+
+
+# =========================================================================================
+# STEP 1 : LOAD RAW DATA
+# =========================================================================================
+def load_raw_data():
+    file1 = pd.read_csv(FILE1_PATH)
+    file2 = pd.read_csv(FILE2_PATH)
+    test_phys = pd.read_csv(TEST_PHYS_PATH)
+
+    rename_map = {
+        "total_reps_visits": "total_representative_visits",
+        "saving_card_dropped": "saving_cards_dropped",
+    }
+    file1 = file1.rename(columns=rename_map)
+    file1 = file1.loc[:, ~file1.columns.str.contains("^Unnamed")]
+    file1 = file1.sort_values([ID_COL, TIME_COL]).reset_index(drop=True)
+    return file1, file2, test_phys
+
+
+# =========================================================================================
+# STEP 1b : ORDINAL ENCODE CALENDAR QUARTER
+#           Needed both as a duration-aware model feature and to define the time-based
+#           train(3-8) / test(9-10) / score(->11) split precisely, regardless of what
+#           format year_quarter is actually stored in (e.g. '2023Q1', 'Q3', 1..10).
+# =========================================================================================
+def encode_quarter_ordinal(df):
+    df = df.copy()
+    quarters_sorted = sorted(df[TIME_COL].dropna().unique().tolist())
+    quarter_map = {q: i + 1 for i, q in enumerate(quarters_sorted)}
+    df["quarter_ordinal"] = df[TIME_COL].map(quarter_map)
+    return df, quarter_map
+
+
+# =========================================================================================
+# STEP 2 : ORDINAL ENCODE PHYSICIAN_VALUE_TIER (before lagging)
+# =========================================================================================
+def encode_tier_ordinal(df):
+    df = df.copy()
+    tiers_present = sorted(df[TIER_COL].dropna().unique().tolist())
+
+    def sort_key(label):
+        try:
+            return int(str(label).split("-")[0])
+        except Exception:
+            return str(label)
+
+    tiers_sorted = sorted(tiers_present, key=sort_key)
+    tier_map = {label: rank + 1 for rank, label in enumerate(tiers_sorted)}
+    df[TIER_COL] = df[TIER_COL].map(tier_map)
+    return df, tier_map
+
+
+# =========================================================================================
+# STEP 3 : BUILD THE LAG-FEATURE PANEL
+# =========================================================================================
+def build_lag_panel(file1, is_scoring=False):
+    df = file1.sort_values([ID_COL, TIME_COL]).copy()
+    grp = df.groupby(ID_COL, group_keys=False)
+
+    all_metric_cols = LAG_AVG_CHANGE_COLS + LAG_CHANGE_ONLY_COLS + MOST_RECENT_ONLY_COLS + [TIER_COL]
+    all_metric_cols = [c for c in all_metric_cols if c in df.columns]
+
+    lag_frames = {ID_COL: df[ID_COL], TIME_COL: df[TIME_COL], TARGET_COL: df[TARGET_COL]}
+
+    # Duration-aware features, both known at prediction time -> no leakage. These let the
+    # model learn that longer-tenured non-adopters (the ENTIRE Q11 scoring population,
+    # who survived all 10 quarters) behave differently than a physician in quarter 3.
+    lag_frames["physician_tenure_quarters"] = grp.cumcount() + 1
+    lag_frames["calendar_quarter_num"] = df["quarter_ordinal"].values
+
+    for col in all_metric_cols:
+        lag1 = grp[col].shift(1)
+        lag2 = grp[col].shift(2)
+        lag_frames[f"{col}_lag1"] = lag1
+        lag_frames[f"{col}_lag2"] = lag2
+
+        if col in LAG_AVG_CHANGE_COLS:
+            lag_frames[f"{col}_lag_avg"] = np.where(
+                lag1.notna() & lag2.notna(), (lag1 + lag2) / 2, np.nan
+            )
+            lag_frames[f"{col}_lag_change"] = np.where(
+                lag1.notna() & lag2.notna(), lag1 - lag2, np.nan
+            )
+        elif col in LAG_CHANGE_ONLY_COLS:
+            lag_frames[f"{col}_lag_change"] = np.where(
+                lag1.notna() & lag2.notna(), lag1 - lag2, np.nan
+            )
+        elif col == TIER_COL:
+            lag_frames[f"{col}_lag_change"] = np.where(
+                lag1.notna() & lag2.notna(), lag1 - lag2, np.nan
+            )
+
+    panel = pd.DataFrame(lag_frames)
+
+    for col in MOST_RECENT_ONLY_COLS:
+        panel[col] = panel[f"{col}_lag1"]
+        panel.drop(columns=[f"{col}_lag1", f"{col}_lag2"], inplace=True, errors="ignore")
+
+    if not is_scoring:
+        # ---- A1: keep only rows where the physician had NOT adopted in any prior quarter ----
+        cum_adopt_before = grp[TARGET_COL].apply(lambda s: s.shift(1).fillna(0).cumsum())
+        panel["_adopted_before"] = (cum_adopt_before.values > 0)
+        panel = panel[~panel["_adopted_before"]].drop(columns=["_adopted_before"])
+
+        # ---- A3: drop rows with no history at all (lag1 fully missing) ----
+        lag1_cols = [c for c in panel.columns if c.endswith("_lag1")]
+        panel = panel.dropna(subset=lag1_cols, how="all")
+
+        panel = panel.rename(columns={TIME_COL: "target_quarter"})
+        panel = panel.reset_index(drop=True)
+        assert_single_adoption_per_physician(panel)
+        return panel
+
+    else:
+        panel = panel.rename(columns={TIME_COL: "target_quarter"})
+        panel = panel.sort_values([ID_COL, "target_quarter"]).groupby(ID_COL).tail(1)
+        panel = panel.drop(columns=[TARGET_COL])
+        return panel.reset_index(drop=True)
+
+
+def assert_single_adoption_per_physician(panel):
+    """
+    Verifies "only use a physician's data up to their first adoption quarter" is
+    actually enforced: no physician appears more than once with target==1 (and,
+    implicitly, since later rows were dropped, no physician has a row after their
+    adoption quarter). Hard-fails loudly if violated.
+    """
+    positive_counts = panel[panel[TARGET_COL] == 1].groupby(ID_COL).size()
+    violators = positive_counts[positive_counts > 1]
+    if len(violators) > 0:
+        raise AssertionError(
+            f"[SANITY CHECK FAILED] {len(violators)} physician(s) have more than one "
+            f"positive (adoption) row in the training panel. Example IDs: "
+            f"{violators.index[:5].tolist()}"
+        )
+    print(f"[Sanity] Verified: every physician has at most 1 adoption row in the panel "
+          f"({positive_counts.shape[0]} physicians adopt at some point in the observed "
+          f"history) - post-adoption quarters were correctly excluded.")
+
+
+# =========================================================================================
+# STEP 4 : MERGE WITH STATIC FILE2 + ONE-HOT ENCODE CATEGORICALS
+# =========================================================================================
+def merge_static_and_encode(panel, file2, ohe=None, fit_ohe=False):
+    merged = panel.merge(file2, on=ID_COL, how="left")
+
+    if fit_ohe:
+        ohe = OneHotEncoder(handle_unknown="ignore", sparse_output=False)
+        ohe.fit(merged[CATEGORICAL_COLS])
+
+    encoded = ohe.transform(merged[CATEGORICAL_COLS])
+    encoded_df = pd.DataFrame(
+        encoded, columns=ohe.get_feature_names_out(CATEGORICAL_COLS), index=merged.index
+    )
+    merged = pd.concat([merged.drop(columns=CATEGORICAL_COLS), encoded_df], axis=1)
+    return merged, ohe
+
+
+# =========================================================================================
+# STEP 5 : TIME-BASED TRAIN / TEST SPLIT  (replaces the old random 80/20 split)
+# =========================================================================================
+def time_based_split(train_merged, train_range=TRAIN_QUARTER_RANGE, test_range=TEST_QUARTER_RANGE):
+    train_mask = train_merged["calendar_quarter_num"].between(*train_range)
+    test_mask = train_merged["calendar_quarter_num"].between(*test_range)
+    train_df = train_merged[train_mask].copy().reset_index(drop=True)
+    test_df = train_merged[test_mask].copy().reset_index(drop=True)
+    print(f"[Split] TRAIN = calendar quarters {train_range} -> {len(train_df)} rows, "
+          f"positive rate {train_df[TARGET_COL].mean():.3%}")
+    print(f"[Split] TEST  = calendar quarters {test_range} -> {len(test_df)} rows, "
+          f"positive rate {test_df[TARGET_COL].mean():.3%}")
+    excluded_n = len(train_merged) - len(train_df) - len(test_df)
+    if excluded_n > 0:
+        print(f"[Split] {excluded_n} rows outside quarters {train_range[0]}-{test_range[1]} "
+              f"were not used for train or test (by design).")
+    return train_df, test_df
+
+
+# =========================================================================================
+# STEP 6 : EDA - MISSING VALUE HANDLING, GENDER MODE IMPUTE, VIF (restricted), CORRELATION
+# =========================================================================================
+def eda_missing_value_drop(train_df, test_df, threshold=0.20):
+    """
+    Drops train-derived high-missingness columns, EXCEPT lag1/lag2/lag_avg/lag_change
+    columns, which are always protected and handed to the model regardless of
+    missingness - both XGBoost and LightGBM handle NaN natively and correctly.
+    """
+    protected_suffixes = ("_lag1", "_lag2", "_lag_avg", "_lag_change")
+    miss_pct = train_df.isna().mean()
+    candidates = miss_pct[miss_pct > threshold].index.tolist()
+    cols_to_drop = [
+        c for c in candidates
+        if c not in NON_FEATURE_COLS and not c.endswith(protected_suffixes)
+    ]
+    protected_but_missing = [c for c in candidates if c.endswith(protected_suffixes)]
+    if protected_but_missing:
+        print(f"[EDA] NOTE: {len(protected_but_missing)} lag column(s) exceed "
+              f"{threshold*100:.0f}% missing but are PROTECTED (kept for the model per "
+              f"instruction, native NaN handling covers this): {protected_but_missing}")
+    print(f"[EDA] Dropping {len(cols_to_drop)} non-lag column(s) with >{threshold*100:.0f}% "
+          f"missing (train-derived): {cols_to_drop}")
+    train_df = train_df.drop(columns=cols_to_drop)
+    test_df = test_df.drop(columns=[c for c in cols_to_drop if c in test_df.columns])
+    return train_df, test_df, cols_to_drop
+
+
+def impute_gender_mode(train_df, test_df, unknown_tokens=("Unknown", "unknown", "U", "?")):
+    gender_cols = [c for c in train_df.columns if c.startswith("physician_gender_")]
+    if not gender_cols:
+        return train_df, test_df
+
+    unknown_cols = [c for c in gender_cols if any(tok in c for tok in unknown_tokens)]
+    if unknown_cols:
+        mode_col = train_df[[c for c in gender_cols if c not in unknown_cols]].sum().idxmax()
+        for udf in (train_df, test_df):
+            for ucol in unknown_cols:
+                mask = udf[ucol] == 1
+                udf.loc[mask, mode_col] = 1
+                udf.loc[mask, ucol] = 0
+    return train_df, test_df
+
+
+def compute_vif(df, feature_cols):
+    # -999/0 fill here is ONLY for the VIF diagnostic matrix (VIF requires no NaN),
+    # never used for the actual model.
+    X = df[feature_cols].fillna(0).astype(float)
+    vif_data = pd.DataFrame()
+    vif_data["feature"] = feature_cols
+    vif_data["VIF"] = [variance_inflation_factor(X.values, i) for i in range(X.shape[1])]
+    return vif_data.sort_values("VIF", ascending=False)
+
+
+def vif_reduce_restricted(train_df, test_df, feature_cols, eligible_cols, vif_threshold=10.0, max_iter=50):
+    """
+    Computes VIF across the FULL current feature set (so multicollinearity from lag
+    features is still accounted for), but only ever REMOVES a column if it is in
+    eligible_cols (physician_gender_* / physician_value_tier_* dummies). Lag columns
+    are never removed here even with very high VIF, per instruction - "let model
+    consume them"; the model handles correlated tree-splittable features fine.
+    """
+    cols = feature_cols.copy()
+    for _ in range(max_iter):
+        vif_df = compute_vif(train_df, cols)
+        eligible_rows = vif_df[vif_df["feature"].isin(eligible_cols)]
+        if eligible_rows.empty:
+            break
+        worst = eligible_rows.iloc[0]
+        if worst["VIF"] <= vif_threshold:
+            break
+        print(f"[VIF] Dropping '{worst['feature']}' (VIF={worst['VIF']:.1f}) "
+              f"- eligible column (gender/tier), threshold {vif_threshold}")
+        cols.remove(worst["feature"])
+
+    dropped = [c for c in feature_cols if c not in cols]
+    train_df = train_df.drop(columns=dropped)
+    test_df = test_df.drop(columns=[c for c in dropped if c in test_df.columns])
+    print(f"[VIF] Dropped {len(dropped)} gender/tier column(s) total: {dropped}")
+    print(f"[VIF] All lag1/lag2/lag_avg/lag_change columns retained regardless of VIF.")
+    return train_df, test_df, cols, dropped
+
+
+def plot_correlation_heatmap(train_df, feature_cols, out_path="train_correlation_heatmap.png"):
+    plt.figure(figsize=(16, 12))
+    corr = train_df[feature_cols].fillna(0).corr()
+    sns.heatmap(corr, cmap="coolwarm", center=0, linewidths=0.3)
+    plt.title("Feature Correlation Heatmap (TRAIN ONLY, quarters 3-8)")
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=150)
+    plt.close()
+    print(f"[EDA] Correlation heatmap saved to {out_path}")
+
+
+# =========================================================================================
+# STEP 7 : SHAP-BASED FEATURE SELECTION
+#          A feature is dropped only if it is unimportant in BOTH the XGBoost and
+#          LightGBM Stage-1 models (below SHAP_IMPORTANCE_MIN_PCT of total importance
+#          in each). This directly implements "if shap feature importance is low on
+#          all [both] models then remove, re-run model".
+# =========================================================================================
+def select_features_by_shap(importance_dfs, min_pct=0.10):
+    combined = pd.concat(importance_dfs)
+    # take the MAX importance-% across models for each feature: only drop if unimportant
+    # everywhere, never drop a feature that one model finds valuable.
+    per_model_pct = []
+    for df in importance_dfs:
+        d = df.copy()
+        d["pct"] = d["mean_abs_shap"] / d["mean_abs_shap"].sum() * 100
+        per_model_pct.append(d.set_index("feature")["pct"])
+    pct_table = pd.concat(per_model_pct, axis=1)
+    pct_table.columns = [f"model_{i+1}_pct" for i in range(len(per_model_pct))]
+    pct_table["max_pct_across_models"] = pct_table.max(axis=1)
+
+    keep = pct_table[pct_table["max_pct_across_models"] >= min_pct].index.tolist()
+    drop = pct_table[pct_table["max_pct_across_models"] < min_pct].index.tolist()
+    return keep, drop, pct_table.sort_values("max_pct_across_models")
+
+
+# =========================================================================================
+# STEP 8 : ROLLING-WINDOW (TIME-BASED, EXPANDING) CROSS VALIDATION SPLITS
+# =========================================================================================
+def rolling_window_splits(df, quarter_col="target_quarter", min_train_quarters=ROLLING_MIN_TRAIN_QUARTERS):
+    quarters = sorted(df["calendar_quarter_num"].unique())
+    splits = []
+    for i in range(min_train_quarters, len(quarters)):
+        train_quarters = quarters[:i]
+        val_quarter = quarters[i]
+        train_idx = df.index[df["calendar_quarter_num"].isin(train_quarters)]
+        val_idx = df.index[df["calendar_quarter_num"] == val_quarter]
+        if len(val_idx) > 0 and df.loc[val_idx, TARGET_COL].nunique() > 1:
+            splits.append((train_idx, val_idx))
+    return splits
+
+
+# =========================================================================================
+# STEP 8b : CV METHOD COMPARISON - rolling window vs. StratifiedKFold vs. plain KFold
+#          Uses one fixed, reasonable baseline model (no Optuna) purely to produce a fair
+#          apples-to-apples PR-AUC comparison of the validation SCHEME itself.
+# =========================================================================================
+def compare_cv_strategies(train_df, X, y):
+    baseline_params = dict(
+        n_estimators=300, max_depth=5, learning_rate=0.05, subsample=0.8,
+        colsample_bytree=0.8, random_state=RANDOM_STATE, eval_metric="aucpr",
+        use_label_encoder=False,
+    )
+    neg, pos = (y == 0).sum(), (y == 1).sum()
+    spw = neg / max(pos, 1)
+
+    def fit_and_score(train_idx, val_idx):
+        model = xgb.XGBClassifier(**baseline_params, scale_pos_weight=spw)
+        model.fit(X.loc[train_idx], y.loc[train_idx])
+        proba = model.predict_proba(X.loc[val_idx])[:, 1]
+        return average_precision_score(y.loc[val_idx], proba)
+
+    # (a) rolling window, time-ordered, expanding
+    rolling_splits = rolling_window_splits(train_df)
+    rolling_scores = [fit_and_score(tr, va) for tr, va in rolling_splits]
+
+    # (b) StratifiedKFold - random, ignores time order
+    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=RANDOM_STATE)
+    skf_scores = [fit_and_score(X.index[tr], X.index[va]) for tr, va in skf.split(X, y)]
+
+    # (c) plain KFold - random, ignores time order and class balance
+    kf = KFold(n_splits=5, shuffle=True, random_state=RANDOM_STATE)
+    kf_scores = [fit_and_score(X.index[tr], X.index[va]) for tr, va in kf.split(X)]
+
+    print("\n===== CV METHOD COMPARISON (PR-AUC, fixed baseline model) =====")
+    print(f"Rolling window (time-ordered, expanding) : mean={np.mean(rolling_scores):.4f}  "
+          f"folds={[round(s,3) for s in rolling_scores]}")
+    print(f"StratifiedKFold (random, 5-fold)          : mean={np.mean(skf_scores):.4f}  "
+          f"folds={[round(s,3) for s in skf_scores]}")
+    print(f"Plain KFold (random, 5-fold)               : mean={np.mean(kf_scores):.4f}  "
+          f"folds={[round(s,3) for s in kf_scores]}")
+    print("[CV Decision] Using ROLLING WINDOW for all real hyperparameter tuning below. "
+          "Even if StratifiedKFold/KFold show a higher mean PR-AUC here, that number is "
+          "inflated by letting the model train on chronologically later data than what "
+          "it's validated on - a scenario that can never happen in real deployment "
+          "(train quarters 3-8, predict 9-10, then predict 11). Rolling window is the "
+          "only scheme that mirrors the real task, so it's the trustworthy one to tune on.")
+    return {"rolling": rolling_scores, "stratified_kfold": skf_scores, "kfold": kf_scores}
+
+
+# =========================================================================================
+# STEP 9 : OPTUNA HYPERPARAMETER TUNING (XGBoost & LightGBM), scale_pos_weight, NO SMOTE
+# =========================================================================================
+def optuna_objective_factory(model_type, X, y, splits):
+    def objective(trial):
+        fold_scores = []
+        for train_idx, val_idx in splits:
+            X_tr, y_tr = X.loc[train_idx], y.loc[train_idx]
+            X_val, y_val = X.loc[val_idx], y.loc[val_idx]
+
+            neg, pos = (y_tr == 0).sum(), (y_tr == 1).sum()
+            base_ratio = neg / max(pos, 1)
+            spw_multiplier = trial.suggest_float("spw_multiplier", 0.3, 3.0)
+            scale_pos_weight = base_ratio * spw_multiplier
+
+            if model_type == "xgb":
+                params = {
+                    "n_estimators": trial.suggest_int("n_estimators", 100, 600),
+                    "max_depth": trial.suggest_int("max_depth", 3, 10),
+                    "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.3, log=True),
+                    "subsample": trial.suggest_float("subsample", 0.6, 1.0),
+                    "colsample_bytree": trial.suggest_float("colsample_bytree", 0.6, 1.0),
+                    "min_child_weight": trial.suggest_int("min_child_weight", 1, 10),
+                    "reg_alpha": trial.suggest_float("reg_alpha", 1e-3, 10, log=True),
+                    "reg_lambda": trial.suggest_float("reg_lambda", 1e-3, 10, log=True),
+                    "scale_pos_weight": scale_pos_weight,
+                    "random_state": RANDOM_STATE,
+                    "eval_metric": "aucpr",
+                    "use_label_encoder": False,
+                }
+                model = xgb.XGBClassifier(**params)
+            else:
+                params = {
+                    "n_estimators": trial.suggest_int("n_estimators", 100, 600),
+                    "num_leaves": trial.suggest_int("num_leaves", 15, 128),
+                    "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.3, log=True),
+                    "subsample": trial.suggest_float("subsample", 0.6, 1.0),
+                    "colsample_bytree": trial.suggest_float("colsample_bytree", 0.6, 1.0),
+                    "min_child_samples": trial.suggest_int("min_child_samples", 5, 50),
+                    "reg_alpha": trial.suggest_float("reg_alpha", 1e-3, 10, log=True),
+                    "reg_lambda": trial.suggest_float("reg_lambda", 1e-3, 10, log=True),
+                    "scale_pos_weight": scale_pos_weight,
+                    "random_state": RANDOM_STATE,
+                    "verbosity": -1,
+                }
+                model = lgb.LGBMClassifier(**params)
+
+            # NaN passed through untouched - both models handle missing values natively.
+            # No fillna(-999), no SMOTE.
+            model.fit(X_tr, y_tr)
+            preds = model.predict_proba(X_val)[:, 1]
+            fold_scores.append(average_precision_score(y_val, preds))  # PR-AUC
+
+        return float(np.mean(fold_scores))
+    return objective
+
+
+def tune_model(model_type, X, y, splits, n_trials=40):
+    study = optuna.create_study(direction="maximize", sampler=optuna.samplers.TPESampler(seed=RANDOM_STATE))
+    study.optimize(optuna_objective_factory(model_type, X, y, splits), n_trials=n_trials, show_progress_bar=False)
+    print(f"[Optuna:{model_type}] Best PR-AUC (CV) = {study.best_value:.4f}")
+    print(f"[Optuna:{model_type}] Best params = {study.best_params}")
+    return study.best_params
+
+
+# =========================================================================================
+# STEP 10 : FINAL MODEL TRAINING (best params, scale_pos_weight, NO SMOTE)
+# =========================================================================================
+def fit_final_model(model_type, best_params, X_train, y_train):
+    neg, pos = (y_train == 0).sum(), (y_train == 1).sum()
+    scale_pos_weight = (neg / max(pos, 1)) * best_params.get("spw_multiplier", 1.0)
+    params = {k: v for k, v in best_params.items() if k != "spw_multiplier"}
+
+    if model_type == "xgb":
+        model = xgb.XGBClassifier(**params, scale_pos_weight=scale_pos_weight,
+                                   random_state=RANDOM_STATE, eval_metric="aucpr",
+                                   use_label_encoder=False)
+    else:
+        model = lgb.LGBMClassifier(**params, scale_pos_weight=scale_pos_weight,
+                                    random_state=RANDOM_STATE, verbosity=-1)
+
+    model.fit(X_train, y_train)  # NaN untouched - no fillna(-999), no SMOTE
+    return model
+
+
+# =========================================================================================
+# STEP 11 : OUT-OF-FOLD PREDICTIONS + THRESHOLD OPTIMIZATION
+# =========================================================================================
+def get_oof_predictions(model_type, best_params, X, y, splits):
+    """Returns OOF proba/y and a per-row fold_id (0 = earliest, increasing with time)."""
+    oof_index, oof_proba, oof_y, oof_fold = [], [], [], []
+    for fold_id, (train_idx, val_idx) in enumerate(splits):
+        X_tr, y_tr = X.loc[train_idx], y.loc[train_idx]
+        X_val, y_val = X.loc[val_idx], y.loc[val_idx]
+
+        neg, pos = (y_tr == 0).sum(), (y_tr == 1).sum()
+        scale_pos_weight = (neg / max(pos, 1)) * best_params.get("spw_multiplier", 1.0)
+        params = {k: v for k, v in best_params.items() if k != "spw_multiplier"}
+
+        if model_type == "xgb":
+            model = xgb.XGBClassifier(**params, scale_pos_weight=scale_pos_weight,
+                                       random_state=RANDOM_STATE, eval_metric="aucpr",
+                                       use_label_encoder=False)
+        else:
+            model = lgb.LGBMClassifier(**params, scale_pos_weight=scale_pos_weight,
+                                        random_state=RANDOM_STATE, verbosity=-1)
+
+        model.fit(X_tr, y_tr)
+        proba = model.predict_proba(X_val)[:, 1]
+        oof_index.extend(val_idx.tolist())
+        oof_proba.extend(proba.tolist())
+        oof_y.extend(y_val.tolist())
+        oof_fold.extend([fold_id] * len(val_idx))
+
+    return (pd.Series(oof_proba, index=oof_index), pd.Series(oof_y, index=oof_index),
+            pd.Series(oof_fold, index=oof_index))
+
+
+def find_best_threshold_fbeta(y_true, proba, beta=1.5):
+    precisions, recalls, thresholds = precision_recall_curve(y_true, proba)
+    precisions, recalls = precisions[:-1], recalls[:-1]
+    with np.errstate(divide="ignore", invalid="ignore"):
+        fbeta = (1 + beta**2) * (precisions * recalls) / ((beta**2 * precisions) + recalls)
+    fbeta = np.nan_to_num(fbeta, nan=0.0)
+    best_idx = np.argmax(fbeta)
+    return float(thresholds[best_idx]), precisions[best_idx], recalls[best_idx], fbeta[best_idx]
+
+
+def print_threshold_scan(y_true, proba, label=""):
+    print(f"\n[Threshold scan{(' - ' + label) if label else ''}] "
+          f"(precision / recall / F1 / predicted-positive-count at each cutoff)")
+    print(f"{'thresh':>7} {'precision':>10} {'recall':>8} {'f1':>7} {'n_pred_pos':>11}")
+    for t in np.arange(0.05, 0.95, 0.05):
+        preds = (proba >= t).astype(int)
+        p = precision_score(y_true, preds, zero_division=0)
+        r = recall_score(y_true, preds, zero_division=0)
+        f = f1_score(y_true, preds, zero_division=0)
+        print(f"{t:7.2f} {p:10.4f} {r:8.4f} {f:7.4f} {preds.sum():11d}")
+
+
+def print_scoring_threshold_scan(proba, n_physicians, label=""):
+    """
+    No ground truth exists for the Q11 scoring set, so this scan shows predicted COUNT
+    only at each cutoff - this is what directly answers "what threshold gives me
+    250-300 physicians".
+    """
+    print(f"\n[SCORING threshold scan{(' - ' + label) if label else ''}] "
+          f"predicted-positive-count out of {n_physicians} physicians, at each cutoff:")
+    print(f"{'thresh':>7} {'n_pred_pos':>11} {'pct':>8}")
+    for t in np.arange(0.02, 0.98, 0.02):
+        n = int((proba >= t).sum())
+        flag = "  <-- in your 250-300 target range" if 250 <= n <= 300 else ""
+        print(f"{t:7.2f} {n:11d} {n/n_physicians:7.1%}{flag}")
+
+
+def find_volume_threshold(proba, target_n):
+    """Returns the probability cutoff that selects exactly target_n physicians (by rank)."""
+    sorted_desc = np.sort(proba)[::-1]
+    if target_n >= len(sorted_desc):
+        return float(sorted_desc[-1])
+    return float(sorted_desc[target_n - 1])
+
+
+# =========================================================================================
+# STEP 12 : FULL EVALUATION SUITE (classification + business metrics)
+# =========================================================================================
+def evaluate_model(model, X, y, dataset_name, model_name, threshold):
+    proba = model.predict_proba(X)[:, 1]
+    preds = (proba >= threshold).astype(int)
+
+    tn, fp, fn, tp = confusion_matrix(y, preds).ravel()
+    specificity = tn / (tn + fp) if (tn + fp) > 0 else np.nan
+
+    acc = accuracy_score(y, preds)
+    prec = precision_score(y, preds, zero_division=0)
+    rec = recall_score(y, preds, zero_division=0)
+    f1 = f1_score(y, preds, zero_division=0)
+    fbeta = fbeta_score(y, preds, beta=FBETA_BETA, zero_division=0)
+    roc_auc = roc_auc_score(y, proba)
+    pr_auc = average_precision_score(y, proba)
+    mae = mean_absolute_error(y, proba)
+
+    nonzero_mask = y > 0
+    mape = (np.abs(y[nonzero_mask] - proba[nonzero_mask]) / y[nonzero_mask]).mean() * 100 if nonzero_mask.sum() > 0 else np.nan
+
+    df_rank = pd.DataFrame({"y": y.values, "proba": proba}).sort_values("proba", ascending=False)
+    df_rank["decile"] = pd.qcut(df_rank["proba"].rank(method="first", ascending=False), 10, labels=False)
+    overall_rate = df_rank["y"].mean()
+    top_decile_rate = df_rank[df_rank["decile"] == 0]["y"].mean()
+    top_decile_lift = top_decile_rate / overall_rate if overall_rate > 0 else np.nan
+    top20pct_n = int(len(df_rank) * 0.2)
+    top20pct_capture = df_rank.head(top20pct_n)["y"].sum() / df_rank["y"].sum() if df_rank["y"].sum() > 0 else np.nan
+
+    print(f"\n===== {model_name} | {dataset_name}  (threshold={threshold:.3f}) =====")
+    print(f"Accuracy            : {acc:.4f}")
+    print(f"Precision           : {prec:.4f}")
+    print(f"Recall (Sensitivity): {rec:.4f}")
+    print(f"Specificity         : {specificity:.4f}")
+    print(f"F1-Score            : {f1:.4f}")
+    print(f"F{FBETA_BETA}-Score           : {fbeta:.4f}")
+    print(f"ROC-AUC             : {roc_auc:.4f}")
+    print(f"PR-AUC              : {pr_auc:.4f}")
+    print(f"MAE (on probability): {mae:.4f}")
+    print(f"MAPE (positives only): {mape:.2f}%")
+    print(f"Top-decile lift     : {top_decile_lift:.2f}x")
+    print(f"Top-20% capture rate: {top20pct_capture:.2%}")
+    print(classification_report(y, preds, zero_division=0))
+
+    return {
+        "accuracy": acc, "precision": prec, "recall": rec, "specificity": specificity,
+        "f1": f1, f"f{FBETA_BETA}": fbeta, "roc_auc": roc_auc, "pr_auc": pr_auc,
+        "mae": mae, "mape": mape, "top_decile_lift": top_decile_lift,
+        "top20pct_capture": top20pct_capture,
+    }
+
+
+# =========================================================================================
+# STEP 13 : SHAP EXPLAINABILITY
+# =========================================================================================
+def run_shap_analysis(model, X_train, model_name, max_display=20):
+    explainer = shap.TreeExplainer(model)
+    shap_values = explainer.shap_values(X_train)  # NaN passed through, matches training
+
+    plt.figure()
+    shap.summary_plot(shap_values, X_train, max_display=max_display, show=False)
+    plt.title(f"SHAP Feature Importance - {model_name}")
+    plt.tight_layout()
+    plt.savefig(f"shap_summary_{model_name}.png", dpi=150)
+    plt.close()
+    print(f"[SHAP] Summary plot saved for {model_name}")
+
+    mean_abs_shap = np.abs(shap_values).mean(axis=0)
+    importance_df = pd.DataFrame({
+        "feature": X_train.columns, "mean_abs_shap": mean_abs_shap
+    }).sort_values("mean_abs_shap", ascending=False)
+    return importance_df
+
+
+# =========================================================================================
+# STEP 14 : MAIN ORCHESTRATION
+# =========================================================================================
+def main():
+    # ---- 1) Load ----
+    file1, file2, test_phys = load_raw_data()
+
+    # ---- 2) Ordinal encode tier + calendar quarter BEFORE lagging ----
+    file1, tier_map = encode_tier_ordinal(file1)
+    print(f"[Tier] Ordinal mapping learned: {tier_map}")
+    file1, quarter_map = encode_quarter_ordinal(file1)
+    print(f"[Quarter] Ordinal mapping learned: {quarter_map}")
+
+    # ---- 3) Build training panel ----
+    train_panel = build_lag_panel(file1, is_scoring=False)
+    print(f"[Panel] Training panel shape: {train_panel.shape}, "
+          f"positive rate: {train_panel[TARGET_COL].mean():.3%}")
+
+    rate_by_quarter = train_panel.groupby("target_quarter")[TARGET_COL].agg(["mean", "count"])
+    print(f"\n[Diagnostic] Adoption rate by target_quarter:\n{rate_by_quarter}")
+
+    # ---- 3b) Build Q11 scoring panel for Test_physicians ----
+    score_panel_full = build_lag_panel(file1, is_scoring=True)
+    score_panel = score_panel_full[score_panel_full[ID_COL].isin(test_phys[ID_COL])].copy()
+    print(f"[Panel] Q11 scoring panel shape: {score_panel.shape} "
+          f"(expected ~{len(test_phys)} physicians)")
+
+    # ---- 4) Merge static file2 + one-hot encode categoricals ----
+    train_merged, ohe = merge_static_and_encode(train_panel, file2, fit_ohe=True)
+    score_merged, _ = merge_static_and_encode(score_panel, file2, ohe=ohe, fit_ohe=False)
+
+    # ---- 5) TIME-BASED split: train = quarters 3-8, test = quarters 9-10 ----
+    # NOTE: physician_id and target_quarter are NOT dropped here - they remain as real
+    # columns in train_df/test_df throughout; they are simply excluded from the feature
+    # list used to fit the model (see feature_cols_all below / NON_FEATURE_COLS).
+    train_df, test_df = time_based_split(train_merged)
+
+    # ---- 6) EDA: missingness drop (lag columns protected), gender mode impute ----
+    train_df, test_df, dropped_missing_cols = eda_missing_value_drop(train_df, test_df, threshold=0.20)
+    train_df, test_df = impute_gender_mode(train_df, test_df)
+
+    numeric_feature_cols = [
+        c for c in train_df.columns
+        if c not in NON_FEATURE_COLS and pd.api.types.is_numeric_dtype(train_df[c])
+    ]
+
+    # ---- 6b) VIF reduction RESTRICTED to gender/tier columns only ----
+    vif_eligible_cols = [
+        c for c in numeric_feature_cols
+        if c.startswith("physician_gender_") or c.startswith(f"{TIER_COL}_")
+    ]
+    print(f"\n[VIF] Columns eligible for VIF-based removal (gender/tier only): {vif_eligible_cols}")
+    train_df, test_df, kept_features_stage1, dropped_vif_cols = vif_reduce_restricted(
+        train_df, test_df, numeric_feature_cols, vif_eligible_cols, vif_threshold=VIF_THRESHOLD
+    )
+    print(f"[VIF] Feature count after VIF step: {len(kept_features_stage1)} "
+          f"(started with {len(numeric_feature_cols)})")
+    plot_correlation_heatmap(train_df, kept_features_stage1)
+
+    for col in kept_features_stage1:
+        if col not in score_merged.columns:
+            score_merged[col] = np.nan
+
+    X_train_s1 = train_df[kept_features_stage1]
+    y_train = train_df[TARGET_COL]
+    X_test_s1 = test_df[kept_features_stage1]
+    y_test = test_df[TARGET_COL]
+
+    # ---- 7) Rolling window CV splits (TRAIN portion, quarters 3-8, only) ----
+    splits = rolling_window_splits(train_df)
+    print(f"\n[CV] Built {len(splits)} rolling-window (expanding) validation folds "
+          f"within quarters {TRAIN_QUARTER_RANGE}")
+
+    # ---- 7b) CV method comparison: rolling window vs. StratifiedKFold vs. KFold ----
+    compare_cv_strategies(train_df, X_train_s1, y_train)
+
+    # =========================================================================
+    # STAGE 1: initial tuning + fit, purely to obtain SHAP importance for pruning
+    # =========================================================================
+    print("\n" + "=" * 60)
+    print("STAGE 1: initial model (full feature set) -> SHAP importance")
+    print("=" * 60)
+    xgb_params_s1 = tune_model("xgb", X_train_s1, y_train, splits, n_trials=40)
+    lgb_params_s1 = tune_model("lgb", X_train_s1, y_train, splits, n_trials=40)
+
+    xgb_model_s1 = fit_final_model("xgb", xgb_params_s1, X_train_s1, y_train)
+    lgb_model_s1 = fit_final_model("lgb", lgb_params_s1, X_train_s1, y_train)
+
+    xgb_importance_s1 = run_shap_analysis(xgb_model_s1, X_train_s1, "XGBoost_Stage1")
+    lgb_importance_s1 = run_shap_analysis(lgb_model_s1, X_train_s1, "LightGBM_Stage1")
+
+    kept_features_stage2, dropped_shap_cols, shap_pct_table = select_features_by_shap(
+        [xgb_importance_s1, lgb_importance_s1], min_pct=SHAP_IMPORTANCE_MIN_PCT
+    )
+    print(f"\n[SHAP-select] Dropping {len(dropped_shap_cols)} feature(s) - unimportant "
+          f"(<{SHAP_IMPORTANCE_MIN_PCT}% of total SHAP importance) in BOTH models:")
+    print(dropped_shap_cols)
+    print(f"[SHAP-select] {len(kept_features_stage2)} features retained for Stage 2.")
+
+    # =========================================================================
+    # STAGE 2: final tuning + fit on the SHAP-pruned feature set
+    # =========================================================================
+    print("\n" + "=" * 60)
+    print("STAGE 2: final model (SHAP-pruned feature set)")
+    print("=" * 60)
+    X_train_final = X_train_s1[kept_features_stage2]
+    X_test_final = X_test_s1[kept_features_stage2]
+
+    xgb_best_params = tune_model("xgb", X_train_final, y_train, splits, n_trials=30)
+    lgb_best_params = tune_model("lgb", X_train_final, y_train, splits, n_trials=30)
+
+    xgb_model = fit_final_model("xgb", xgb_best_params, X_train_final, y_train)
+    lgb_model = fit_final_model("lgb", lgb_best_params, X_train_final, y_train)
+
+    # ---- Out-of-fold predictions -> optimal threshold per model ----
+    xgb_oof_proba, xgb_oof_y, xgb_oof_fold = get_oof_predictions("xgb", xgb_best_params, X_train_final, y_train, splits)
+    lgb_oof_proba, lgb_oof_y, lgb_oof_fold = get_oof_predictions("lgb", lgb_best_params, X_train_final, y_train, splits)
+
+    xgb_thr_pooled, xp, xr, xfb = find_best_threshold_fbeta(xgb_oof_y, xgb_oof_proba, beta=FBETA_BETA)
+    lgb_thr_pooled, lp, lr, lfb = find_best_threshold_fbeta(lgb_oof_y, lgb_oof_proba, beta=FBETA_BETA)
+    print(f"\n[Threshold] XGBoost  POOLED-all-quarters threshold = {xgb_thr_pooled:.3f} "
+          f"(precision={xp:.3f}, recall={xr:.3f}, F{FBETA_BETA}={xfb:.3f})")
+    print(f"[Threshold] LightGBM POOLED-all-quarters threshold = {lgb_thr_pooled:.3f} "
+          f"(precision={lp:.3f}, recall={lr:.3f}, F{FBETA_BETA}={lfb:.3f})")
+
+    xgb_recent_mask = xgb_oof_fold >= (xgb_oof_fold.max() - THRESHOLD_RECENT_N_FOLDS + 1)
+    lgb_recent_mask = lgb_oof_fold >= (lgb_oof_fold.max() - THRESHOLD_RECENT_N_FOLDS + 1)
+    xgb_threshold, xrp, xrr, xrfb = find_best_threshold_fbeta(
+        xgb_oof_y[xgb_recent_mask], xgb_oof_proba[xgb_recent_mask], beta=FBETA_BETA)
+    lgb_threshold, lrp, lrr, lrfb = find_best_threshold_fbeta(
+        lgb_oof_y[lgb_recent_mask], lgb_oof_proba[lgb_recent_mask], beta=FBETA_BETA)
+    print(f"[Threshold] XGBoost  RECENT-{THRESHOLD_RECENT_N_FOLDS}-folds threshold (PRIMARY) = "
+          f"{xgb_threshold:.3f} (precision={xrp:.3f}, recall={xrr:.3f}, F{FBETA_BETA}={xrfb:.3f})")
+    print(f"[Threshold] LightGBM RECENT-{THRESHOLD_RECENT_N_FOLDS}-folds threshold (PRIMARY) = "
+          f"{lgb_threshold:.3f} (precision={lrp:.3f}, recall={lrr:.3f}, F{FBETA_BETA}={lrfb:.3f})")
+
+    print_threshold_scan(xgb_oof_y, xgb_oof_proba, label="XGBoost OOF (all folds, pooled)")
+    print_threshold_scan(lgb_oof_y, lgb_oof_proba, label="LightGBM OOF (all folds, pooled)")
+
+    if FINAL_THRESHOLD_OVERRIDE is not None:
+        xgb_threshold = lgb_threshold = FINAL_THRESHOLD_OVERRIDE
+        print(f"\n[Threshold] Override active - using fixed threshold {FINAL_THRESHOLD_OVERRIDE}")
+
+    # ---- Evaluate both models on TRAIN (3-8) and TEST (9-10) ----
+    results = {}
+    results[("XGBoost", "train")] = evaluate_model(xgb_model, X_train_final, y_train, "train(Q3-8)", "XGBoost", xgb_threshold)
+    results[("XGBoost", "test")] = evaluate_model(xgb_model, X_test_final, y_test, "test(Q9-10)", "XGBoost", xgb_threshold)
+    results[("LightGBM", "train")] = evaluate_model(lgb_model, X_train_final, y_train, "train(Q3-8)", "LightGBM", lgb_threshold)
+    results[("LightGBM", "test")] = evaluate_model(lgb_model, X_test_final, y_test, "test(Q9-10)", "LightGBM", lgb_threshold)
+
+    results_df = pd.DataFrame(results).T
+    print("\n===== MODEL COMPARISON SUMMARY =====")
+    print(results_df)
+
+    xgb_importance_final = run_shap_analysis(xgb_model, X_train_final, "XGBoost_Final")
+    lgb_importance_final = run_shap_analysis(lgb_model, X_train_final, "LightGBM_Final")
+    print("\nTop 15 features (XGBoost, final):\n", xgb_importance_final.head(15))
+    print("\nTop 15 features (LightGBM, final):\n", lgb_importance_final.head(15))
+
+    # ---- Pick best model by TEST PR-AUC ----
+    best_name = "XGBoost" if results[("XGBoost", "test")]["pr_auc"] >= results[("LightGBM", "test")]["pr_auc"] else "LightGBM"
+    best_model = xgb_model if best_name == "XGBoost" else lgb_model
+    best_threshold = xgb_threshold if best_name == "XGBoost" else lgb_threshold
+    print(f"\n[Final] Selected best model based on test PR-AUC: {best_name} "
+          f"(threshold = {best_threshold:.3f})")
+
+    # ---- Score Q11 population ----
+    X_score = score_merged[kept_features_stage2]
+    score_proba = best_model.predict_proba(X_score)[:, 1]
+    score_class_model = (score_proba >= best_threshold).astype(int)
+
+    n_physicians = len(score_proba)
+    print_scoring_threshold_scan(score_proba, n_physicians, label=f"{best_name}, Q11 scoring set")
+
+    volume_threshold = find_volume_threshold(score_proba, VOLUME_TARGET_N)
+    score_class_volume = (score_proba >= volume_threshold).astype(int)
+    print(f"\n[Volume-calibrated] Threshold selecting ~{VOLUME_TARGET_N} physicians "
+          f"(midpoint of your 250-300 target) = {volume_threshold:.4f} "
+          f"-> actually selects {score_class_volume.sum()} physicians.")
+
+    same_tenure_mask = train_df["target_quarter"] == train_df["target_quarter"].max()
+    same_tenure_proba = best_model.predict_proba(X_train_final[same_tenure_mask])[:, 1]
+    print(f"\n[Diagnostic] Mean predicted probability - Q11 scoring population: "
+          f"{score_proba.mean():.4f}")
+    print(f"[Diagnostic] Mean predicted probability - training rows at the SAME latest "
+          f"tenure (target_quarter={train_df['target_quarter'].max()}): "
+          f"{same_tenure_proba.mean():.4f}")
+
+    output = pd.DataFrame({
+        ID_COL: score_merged[ID_COL],
+        "adoption_probability_Q11": score_proba,
+        "predicted_adoption_class_model_threshold": score_class_model,
+        "predicted_adoption_class_volume_calibrated": score_class_volume,
+    }).sort_values("adoption_probability_Q11", ascending=False).reset_index(drop=True)
+
+    output["top_N_flag"] = 0
+    output.loc[output.index[:TOPN_BUSINESS_FLAG], "top_N_flag"] = 1
+
+    output.to_csv(OUTPUT_SCORED_PATH, index=False)
+
+    print(f"\n[Output] Scored file written to: {OUTPUT_SCORED_PATH}")
+    print(f"[Output] Model-threshold ({best_threshold:.3f}) predicted positive: "
+          f"{score_class_model.sum()} / {n_physicians} physicians "
+          f"({score_class_model.sum()/n_physicians:.1%})")
+    print(f"[Output] Volume-calibrated ({volume_threshold:.3f}) predicted positive: "
+          f"{score_class_volume.sum()} / {n_physicians} physicians "
+          f"({score_class_volume.sum()/n_physicians:.1%})  <- use this column for a "
+          f"guaranteed ~250-300 physician list")
+    print(output.head(10))
+
+    return {
+        "train_df": train_df, "test_df": test_df,
+        "xgb_model": xgb_model, "lgb_model": lgb_model,
+        "xgb_threshold": xgb_threshold, "lgb_threshold": lgb_threshold,
+        "results_df": results_df,
+        "kept_features_stage1": kept_features_stage1,
+        "kept_features_stage2": kept_features_stage2,
+        "dropped_shap_cols": dropped_shap_cols,
+        "scored_output": output,
+    }
+
+
+if __name__ == "__main__":
+    main()
